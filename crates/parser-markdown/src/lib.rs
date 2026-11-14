@@ -1,13 +1,20 @@
 //! First-party Markdown parser plugin.
 //!
-//! Parses CommonMark with GitHub-style tables and task lists (via
-//! `pulldown-cmark`) into a document tree. Every node carries the byte span
-//! it came from.
+//! Parses CommonMark (via `pulldown-cmark`) into a document tree in the
+//! shared shape (see "Document shape" in `spec/wire.md`). Every node carries
+//! the byte span it came from.
+//!
+//! - Top-level headings open sections: everything up to the next heading of
+//!   the same or a higher level is nested in a `section` whose first child
+//!   is the heading. Headings inside block quotes or lists stay headings.
+//! - Extensions: GitHub tables, task lists and alerts (`> [!NOTE]` becomes
+//!   an `admonition`), footnotes (`[^1]`), definition lists, and math
+//!   (`$x$` inline, `$$x$$` display).
 //!
 //! - Front matter: YAML between `---` fences, or TOML between `+++` fences,
 //!   at the very start of the file. It must be a mapping; it becomes the
 //!   document's metadata.
-//! - Headings keep an explicit `{#id}` attribute as their `id`; the host
+//! - An explicit `{#id}` on a heading becomes its section's `id`; the host
 //!   generates the others after parsing.
 //! - Raw HTML becomes `raw` nodes with format `html`.
 //! - Soft line breaks become `\n` within text; hard breaks become
@@ -16,14 +23,16 @@
 use std::ops::Range;
 
 use lsdocs_plugin_sdk::doctree::{
-    Align, BlockQuote, CodeBlock, Document, Emphasis, Heading, Image, InlineCode, LineBreak, Link,
-    List, ListItem, Metadata, Node, Paragraph, Raw, Span, Strong, Table, TableCell, TableRow, Text,
-    ThematicBreak, Value,
+    Admonition, Align, BlockQuote, CodeBlock, DefinitionDescription, DefinitionList,
+    DefinitionTerm, Document, Emphasis, FootnoteDefinition, FootnoteReference, Heading, Image,
+    InlineCode, LineBreak, Link, List, ListItem, Math, Metadata, Node, Paragraph, Raw, Section,
+    Span, Strong, Table, TableCell, TableRow, Text, ThematicBreak, Value,
 };
 use lsdocs_plugin_sdk::protocol::{Diagnostic, ParseParams, ParseResult, Severity};
 use lsdocs_plugin_sdk::{Context, Parser, Plugin, PluginResult};
 use pulldown_cmark::{
-    Alignment, CodeBlockKind, Event, MetadataBlockKind, Options, Parser as Cmark, Tag, TagEnd,
+    Alignment, BlockQuoteKind, CodeBlockKind, Event, MetadataBlockKind, Options, Parser as Cmark,
+    Tag, TagEnd,
 };
 
 /// The plugin, as registered with the host.
@@ -52,6 +61,10 @@ impl Parser for Markdown {
 fn options() -> Options {
     Options::ENABLE_TABLES
         | Options::ENABLE_TASKLISTS
+        | Options::ENABLE_GFM
+        | Options::ENABLE_FOOTNOTES
+        | Options::ENABLE_DEFINITION_LIST
+        | Options::ENABLE_MATH
         | Options::ENABLE_HEADING_ATTRIBUTES
         | Options::ENABLE_YAML_STYLE_METADATA_BLOCKS
         | Options::ENABLE_PLUSES_DELIMITED_METADATA_BLOCKS
@@ -155,6 +168,10 @@ impl Builder {
     }
 
     fn event(&mut self, event: Event<'_>, range: Range<usize>) {
+        let event_kind = match event {
+            Event::DisplayMath(_) => MathKind::Display,
+            _ => MathKind::Inline,
+        };
         match event {
             Event::Start(tag) => self.start(tag, &range),
             Event::End(tag) => self.end(tag),
@@ -182,8 +199,17 @@ impl Builder {
                     item.checked = Some(checked);
                 }
             }
-            // Not enabled: math and footnotes.
-            Event::InlineMath(_) | Event::DisplayMath(_) | Event::FootnoteReference(_) => {}
+            Event::InlineMath(value) | Event::DisplayMath(value) => self.push(Node::Math(Math {
+                span: span(&range),
+                display: matches!(event_kind, MathKind::Display),
+                value: value.into_string(),
+            })),
+            Event::FootnoteReference(label) => {
+                self.push(Node::FootnoteReference(FootnoteReference {
+                    span: span(&range),
+                    label: label.into_string(),
+                }))
+            }
         }
     }
 
@@ -200,10 +226,45 @@ impl Builder {
                 id: id.map(|id| id.into_string()),
                 children: vec![],
             })),
-            Tag::BlockQuote(_) => Frame::Node(Node::BlockQuote(BlockQuote {
+            Tag::BlockQuote(None) => Frame::Node(Node::BlockQuote(BlockQuote {
                 span,
                 children: vec![],
             })),
+            // A GitHub alert: `> [!NOTE]`.
+            Tag::BlockQuote(Some(kind)) => Frame::Node(Node::Admonition(Admonition {
+                span,
+                kind: match kind {
+                    BlockQuoteKind::Note => "note",
+                    BlockQuoteKind::Tip => "tip",
+                    BlockQuoteKind::Important => "important",
+                    BlockQuoteKind::Warning => "warning",
+                    BlockQuoteKind::Caution => "caution",
+                }
+                .into(),
+                title: None,
+                children: vec![],
+            })),
+            Tag::FootnoteDefinition(label) => {
+                Frame::Node(Node::FootnoteDefinition(FootnoteDefinition {
+                    span,
+                    label: label.into_string(),
+                    children: vec![],
+                }))
+            }
+            Tag::DefinitionList => Frame::Node(Node::DefinitionList(DefinitionList {
+                span,
+                children: vec![],
+            })),
+            Tag::DefinitionListTitle => Frame::Node(Node::DefinitionTerm(DefinitionTerm {
+                span,
+                children: vec![],
+            })),
+            Tag::DefinitionListDefinition => {
+                Frame::Node(Node::DefinitionDescription(DefinitionDescription {
+                    span,
+                    children: vec![],
+                }))
+            }
             Tag::CodeBlock(kind) => {
                 let (language, info) = match kind {
                     CodeBlockKind::Fenced(info) => {
@@ -301,16 +362,12 @@ impl Builder {
             }
             // Not enabled; keep their content by wrapping it in a paragraph-
             // like container that is flattened on close.
-            Tag::Strikethrough
-            | Tag::Superscript
-            | Tag::Subscript
-            | Tag::FootnoteDefinition(_)
-            | Tag::DefinitionList
-            | Tag::DefinitionListTitle
-            | Tag::DefinitionListDefinition => Frame::Node(Node::Paragraph(Paragraph {
-                span,
-                children: vec![],
-            })),
+            Tag::Strikethrough | Tag::Superscript | Tag::Subscript => {
+                Frame::Node(Node::Paragraph(Paragraph {
+                    span,
+                    children: vec![],
+                }))
+            }
         };
         self.stack.push(frame);
     }
@@ -382,8 +439,67 @@ impl Builder {
         while !self.stack.is_empty() {
             self.end(TagEnd::Paragraph);
         }
+        let children = std::mem::take(&mut self.document.children);
+        self.document.children = sectionize(children);
         (self.document, self.diagnostics)
     }
+}
+
+/// Whether a math event is inline or display.
+enum MathKind {
+    Inline,
+    Display,
+}
+
+/// Nests top-level nodes into sections: each heading opens a section that
+/// holds everything up to the next heading of the same or a higher level
+/// (a lower or equal level number). The heading's id moves to the section.
+fn sectionize(nodes: Vec<Node>) -> Vec<Node> {
+    fn add(section: &mut Section, node: Node) {
+        if let (Some(span), Some(end)) = (&mut section.span, node.span()) {
+            span.end = span.end.max(end.end);
+        }
+        section.children.push(node);
+    }
+    fn close(open: &mut Vec<(u8, Section)>, out: &mut Vec<Node>) {
+        if let Some((_, section)) = open.pop() {
+            let node = Node::Section(section);
+            match open.last_mut() {
+                Some((_, parent)) => add(parent, node),
+                None => out.push(node),
+            }
+        }
+    }
+    let mut out = Vec::new();
+    let mut open: Vec<(u8, Section)> = Vec::new();
+    for node in nodes {
+        match node {
+            Node::Heading(mut heading) => {
+                while open
+                    .last()
+                    .is_some_and(|(level, _)| *level >= heading.level)
+                {
+                    close(&mut open, &mut out);
+                }
+                let section = Section {
+                    span: heading.span,
+                    id: heading.id.take(),
+                    children: vec![],
+                };
+                open.push((heading.level, section));
+                let (_, section) = open.last_mut().expect("just pushed");
+                add(section, Node::Heading(heading));
+            }
+            node => match open.last_mut() {
+                Some((_, section)) => add(section, node),
+                None => out.push(node),
+            },
+        }
+    }
+    while !open.is_empty() {
+        close(&mut open, &mut out);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -406,13 +522,18 @@ mod tests {
     fn block_structure_and_spans() {
         let input = "# Title\n\nSome *em* and **strong** with `code`.\n\n> quote\n\n---\n";
         let doc = parse_ok(input);
-        let kinds: Vec<_> = doc.children.iter().map(|n| n.kind()).collect();
+        let [Node::Section(section)] = &doc.children[..] else {
+            panic!("{doc:?}")
+        };
+        let kinds: Vec<_> = section.children.iter().map(|n| n.kind()).collect();
         assert_eq!(
             kinds,
             ["heading", "paragraph", "block_quote", "thematic_break"]
         );
-        assert_eq!(at(input, &doc.children[0]), "# Title\n");
-        let para = &doc.children[1];
+        // The section spans its heading through its last child.
+        assert_eq!(at(input, &doc.children[0]), input);
+        assert_eq!(at(input, &section.children[0]), "# Title\n");
+        let para = &section.children[1];
         assert_eq!(at(input, para), "Some *em* and **strong** with `code`.\n");
         let inline: Vec<_> = para.children().iter().map(|n| n.kind()).collect();
         assert_eq!(
@@ -463,18 +584,89 @@ mod tests {
         );
     }
 
-    #[test]
-    fn only_explicit_heading_ids_are_set() {
-        let doc = parse_ok("# Intro\n## Intro\n## Custom {#intro-1}\n## Intro\n# `x` & y!\n");
-        let ids: Vec<_> = doc
-            .children
+    /// Sections as `title(id)[subsections]`, with `-` for no id.
+    fn outline(nodes: &[Node]) -> String {
+        nodes
             .iter()
-            .map(|n| match n {
-                Node::Heading(h) => h.id.clone().unwrap_or_default(),
-                _ => unreachable!(),
+            .filter_map(|n| match n {
+                Node::Section(s) => {
+                    let Some(Node::Heading(h)) = s.children.first() else {
+                        panic!("a section starts with its heading: {s:?}")
+                    };
+                    assert_eq!(h.id, None, "the id belongs to the section");
+                    let inner = outline(&s.children[1..]);
+                    let inner = if inner.is_empty() {
+                        inner
+                    } else {
+                        format!("[{inner}]")
+                    };
+                    Some(format!(
+                        "{}({}){inner}",
+                        plain(&h.children),
+                        s.id.as_deref().unwrap_or("-")
+                    ))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn plain(nodes: &[Node]) -> String {
+        lsdocs_plugin_sdk::doctree::plain_text(nodes)
+    }
+
+    #[test]
+    fn headings_open_nested_sections() {
+        let input = "intro\n\n# A\n\na\n\n## B {#bee}\n\n#### D\n\n### C\n\n# E\n\n> ## Quoted\n";
+        let doc = parse_ok(input);
+        assert_eq!(doc.children[0].kind(), "paragraph");
+        assert_eq!(outline(&doc.children), "A(-)[B(bee)[D(-) C(-)]] E(-)");
+        // A heading in a block quote is not a section.
+        let Node::Section(e) = &doc.children[2] else {
+            panic!()
+        };
+        assert_eq!(e.children[1].children()[0].kind(), "heading");
+        assert_eq!(
+            at(input, &doc.children[1]),
+            "# A\n\na\n\n## B {#bee}\n\n#### D\n\n### C\n"
+        );
+    }
+
+    #[test]
+    fn alerts_footnotes_definitions_and_math() {
+        let input = "> [!WARNING]\n> Careful.\n\nSee[^n] $a+b$ and\n$$x^2$$\n\nTerm\n: Meaning\n\n[^n]: The note.\n";
+        let doc = parse_ok(input);
+        let kinds: Vec<_> = doc.descendants().map(|n| n.kind().into_owned()).collect();
+        for kind in [
+            "admonition",
+            "footnote_reference",
+            "math",
+            "definition_list",
+            "definition_term",
+            "definition_description",
+            "footnote_definition",
+        ] {
+            assert!(kinds.iter().any(|k| k == kind), "{kind} missing: {kinds:?}");
+        }
+        let Node::Admonition(alert) = &doc.children[0] else {
+            panic!("{doc:?}")
+        };
+        assert_eq!(alert.kind, "warning");
+        assert_eq!(plain(&alert.children), "Careful.");
+        let maths: Vec<_> = doc
+            .descendants()
+            .filter_map(|n| match n {
+                Node::Math(m) => Some((m.value.as_str(), m.display)),
+                _ => None,
             })
             .collect();
-        assert_eq!(ids, ["", "", "intro-1", "", ""]);
+        assert_eq!(maths, [("a+b", false), ("x^2", true)]);
+        let label = doc.descendants().find_map(|n| match n {
+            Node::FootnoteDefinition(f) => Some(f.label.as_str()),
+            _ => None,
+        });
+        assert_eq!(label, Some("n"));
     }
 
     #[test]
