@@ -7,19 +7,18 @@
 //! - Front matter: YAML between `---` fences, or TOML between `+++` fences,
 //!   at the very start of the file. It must be a mapping; it becomes the
 //!   document's metadata.
-//! - Headings get an `id`: an explicit `{#id}` attribute, or a slug of their
-//!   text, made unique within the document (`intro`, `intro-1`, ...).
+//! - Headings keep an explicit `{#id}` attribute as their `id`; the host
+//!   generates the others after parsing.
 //! - Raw HTML becomes `raw` nodes with format `html`.
 //! - Soft line breaks become `\n` within text; hard breaks become
 //!   `line_break` nodes.
 
-use std::collections::HashMap;
 use std::ops::Range;
 
 use lsdocs_plugin_sdk::doctree::{
     Align, BlockQuote, CodeBlock, Document, Emphasis, Heading, Image, InlineCode, LineBreak, Link,
     List, ListItem, Metadata, Node, Paragraph, Raw, Span, Strong, Table, TableCell, TableRow, Text,
-    ThematicBreak, Value, plain_text,
+    ThematicBreak, Value,
 };
 use lsdocs_plugin_sdk::protocol::{Diagnostic, ParseParams, ParseResult, Severity};
 use lsdocs_plugin_sdk::{Context, Parser, Plugin, PluginResult};
@@ -383,58 +382,8 @@ impl Builder {
         while !self.stack.is_empty() {
             self.end(TagEnd::Paragraph);
         }
-        assign_heading_ids(&mut self.document);
         (self.document, self.diagnostics)
     }
-}
-
-/// Gives every heading an id: its explicit one, or a unique slug of its
-/// text.
-fn assign_heading_ids(doc: &mut Document) {
-    let mut used: HashMap<String, usize> = HashMap::new();
-    // Explicit ids are reserved first, so slugs never collide with them.
-    for node in doc.descendants() {
-        if let Node::Heading(Heading { id: Some(id), .. }) = node {
-            used.entry(id.clone()).or_insert(0);
-        }
-    }
-    fn visit(nodes: &mut [Node], used: &mut HashMap<String, usize>) {
-        for node in nodes {
-            if let Node::Heading(h) = node
-                && h.id.is_none()
-            {
-                let base = match slug(&plain_text(&h.children)) {
-                    s if s.is_empty() => "section".to_owned(),
-                    s => s,
-                };
-                let mut id = base.clone();
-                while let Some(n) = used.get_mut(&id) {
-                    *n += 1;
-                    id = format!("{base}-{n}");
-                }
-                used.insert(id.clone(), 0);
-                h.id = Some(id);
-            }
-            if let Some(children) = node.children_mut() {
-                visit(children, used);
-            }
-        }
-    }
-    visit(&mut doc.children, &mut used);
-}
-
-/// A URL-friendly identifier for a heading: lowercase letters and digits,
-/// with runs of anything else replaced by `-`.
-pub fn slug(title: &str) -> String {
-    let mut out = String::new();
-    for c in title.chars().flat_map(char::to_lowercase) {
-        if c.is_alphanumeric() {
-            out.push(c);
-        } else if !out.is_empty() && !out.ends_with('-') {
-            out.push('-');
-        }
-    }
-    out.trim_end_matches('-').to_owned()
 }
 
 #[cfg(test)]
@@ -515,17 +464,17 @@ mod tests {
     }
 
     #[test]
-    fn heading_ids_are_unique_and_respect_explicit_ones() {
+    fn only_explicit_heading_ids_are_set() {
         let doc = parse_ok("# Intro\n## Intro\n## Custom {#intro-1}\n## Intro\n# `x` & y!\n");
         let ids: Vec<_> = doc
             .children
             .iter()
             .map(|n| match n {
-                Node::Heading(h) => h.id.clone().unwrap(),
+                Node::Heading(h) => h.id.clone().unwrap_or_default(),
                 _ => unreachable!(),
             })
             .collect();
-        assert_eq!(ids, ["intro", "intro-2", "intro-1", "intro-3", "x-y"]);
+        assert_eq!(ids, ["", "", "intro-1", "", ""]);
     }
 
     #[test]
@@ -631,11 +580,5 @@ mod tests {
                 value: "one\ntwo".into()
             })]
         );
-    }
-
-    #[test]
-    fn slugs() {
-        assert_eq!(slug("Getting Started!"), "getting-started");
-        assert_eq!(slug("  Ünïcode & more  "), "ünïcode-more");
     }
 }
