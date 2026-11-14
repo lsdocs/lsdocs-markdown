@@ -37,7 +37,9 @@ use pulldown_cmark::{
 
 /// The plugin, as registered with the host.
 pub fn plugin() -> Plugin {
-    Plugin::new("parser-markdown", env!("CARGO_PKG_VERSION")).parser(Markdown)
+    Plugin::new("parser-markdown", env!("CARGO_PKG_VERSION"))
+        .parser(Markdown)
+        .cacheable()
 }
 
 /// The Markdown parser.
