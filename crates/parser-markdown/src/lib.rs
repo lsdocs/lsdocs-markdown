@@ -19,7 +19,7 @@ use std::ops::Range;
 use lsdocs_plugin_sdk::doctree::{
     Align, BlockQuote, CodeBlock, Document, Emphasis, Heading, Image, InlineCode, LineBreak, Link,
     List, ListItem, Metadata, Node, Paragraph, Raw, Span, Strong, Table, TableCell, TableRow, Text,
-    ThematicBreak, Value,
+    ThematicBreak, Value, plain_text,
 };
 use lsdocs_plugin_sdk::protocol::{Diagnostic, ParseParams, ParseResult, Severity};
 use lsdocs_plugin_sdk::{Context, Parser, Plugin, PluginResult};
@@ -420,19 +420,6 @@ fn assign_heading_ids(doc: &mut Document) {
         }
     }
     visit(&mut doc.children, &mut used);
-}
-
-fn plain_text(nodes: &[Node]) -> String {
-    let mut out = String::new();
-    for node in nodes {
-        match node {
-            Node::Text(t) => out.push_str(&t.value),
-            Node::InlineCode(c) => out.push_str(&c.value),
-            Node::Image(i) => out.push_str(&i.alt),
-            other => out.push_str(&plain_text(other.children())),
-        }
-    }
-    out
 }
 
 /// A URL-friendly identifier for a heading: lowercase letters and digits,
