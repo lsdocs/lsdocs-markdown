@@ -286,6 +286,7 @@ impl Builder {
                 span,
                 url: dest_url.into_string(),
                 title: Some(title.into_string()).filter(|t| !t.is_empty()),
+                target: None,
                 children: vec![],
             })),
             Tag::Image {
