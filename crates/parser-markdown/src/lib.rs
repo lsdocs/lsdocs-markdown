@@ -19,16 +19,29 @@
 //! - Raw HTML becomes `raw` nodes with format `html`.
 //! - Soft line breaks become `\n` within text; hard breaks become
 //!   `line_break` nodes.
+//! - Directives and roles, in MyST's syntax: a fence whose language is
+//!   `{name}` is a directive (the rest of the info line is its argument,
+//!   leading `:option: value` lines or a `---` YAML block its options,
+//!   the rest its content), and `` {name}`text` `` is a role. Those
+//!   plugins declare (see "Syntax extensions" in `spec/wire.md`) are read
+//!   by their declaration: options are checked and markup content is
+//!   parsed. Other directives become custom nodes of their name with the
+//!   content as text, as unknown reStructuredText directives do; other
+//!   roles stay text and code.
 
+use std::collections::BTreeMap;
 use std::ops::Range;
 
 use lsdocs_plugin_sdk::doctree::{
-    Admonition, Align, BlockQuote, CodeBlock, DefinitionDescription, DefinitionList,
+    Admonition, Align, BlockQuote, CodeBlock, Custom, DefinitionDescription, DefinitionList,
     DefinitionTerm, Document, Emphasis, FootnoteDefinition, FootnoteReference, Heading, Image,
     InlineCode, LineBreak, Link, List, ListItem, Math, Metadata, Node, Paragraph, Raw, Section,
     Span, Strong, Table, TableCell, TableRow, Text, ThematicBreak, Value,
 };
-use lsdocs_plugin_sdk::protocol::{Diagnostic, ParseParams, ParseResult, Severity};
+use lsdocs_plugin_sdk::protocol::{
+    ArgumentSyntax, ContentSyntax, Diagnostic, DirectiveSyntax, OptionSyntax, ParseParams,
+    ParseResult, Severity, Syntax,
+};
 use lsdocs_plugin_sdk::{Context, Parser, Plugin, PluginResult};
 use pulldown_cmark::{
     Alignment, BlockQuoteKind, CodeBlockKind, Event, MetadataBlockKind, Options, Parser as Cmark,
@@ -52,7 +65,8 @@ impl Parser for Markdown {
     }
 
     async fn parse(&self, params: ParseParams, _ctx: &Context) -> PluginResult<ParseResult> {
-        let (document, diagnostics) = parse(&params.source, &params.text);
+        let (document, diagnostics) =
+            parse_with_syntax(&params.source, &params.text, &params.syntax);
         Ok(ParseResult {
             document,
             diagnostics,
@@ -75,19 +89,75 @@ fn options() -> Options {
 /// Parses Markdown into a document, plus any problems found (e.g. invalid
 /// front matter).
 pub fn parse(source: &str, input: &str) -> (Document, Vec<Diagnostic>) {
-    let mut builder = Builder::new(source);
-    for (event, range) in Cmark::new_ext(input, options()).into_offset_iter() {
+    parse_with_syntax(source, input, &Syntax::default())
+}
+
+/// Parses Markdown as [`parse`] does, reading the directives and roles of
+/// `syntax` by their declarations.
+pub fn parse_with_syntax(
+    source: &str,
+    input: &str,
+    syntax: &Syntax,
+) -> (Document, Vec<Diagnostic>) {
+    parse_part(source, input, syntax, options())
+}
+
+/// Parses `input`, the whole file or a piece of it, with `options`.
+fn parse_part(
+    source: &str,
+    input: &str,
+    syntax: &Syntax,
+    options: Options,
+) -> (Document, Vec<Diagnostic>) {
+    let mut builder = Builder::new(source, input, syntax);
+    for (event, range) in Cmark::new_ext(input, options).into_offset_iter() {
         builder.event(event, range);
     }
     builder.finish()
+}
+
+/// Parses a piece of the file (a directive's content or argument) found
+/// at `map`'s offsets: no front matter, and spans moved to where the
+/// piece is in the file.
+fn parse_piece(
+    source: &str,
+    piece: &str,
+    syntax: &Syntax,
+    map: &impl Fn(u32) -> u32,
+) -> (Vec<Node>, Vec<Diagnostic>) {
+    let options = options()
+        - Options::ENABLE_YAML_STYLE_METADATA_BLOCKS
+        - Options::ENABLE_PLUSES_DELIMITED_METADATA_BLOCKS;
+    let (mut doc, mut diagnostics) = parse_part(source, piece, syntax, options);
+    move_spans(&mut doc.children, map);
+    for d in &mut diagnostics {
+        if let Some(s) = &mut d.span {
+            *s = Span::new(map(s.start), map(s.end));
+        }
+    }
+    (doc.children, diagnostics)
+}
+
+/// Moves the spans of `nodes` and their descendants by `map`.
+fn move_spans(nodes: &mut [Node], map: &impl Fn(u32) -> u32) {
+    for node in nodes {
+        if let Some(s) = node.span_mut() {
+            *s = Span::new(map(s.start), map(s.end));
+        }
+        if let Some(children) = node.children_mut() {
+            move_spans(children, map);
+        }
+    }
 }
 
 /// What an open element is collecting.
 enum Frame {
     /// A node whose children are collected into it.
     Node(Node),
-    /// A code block; text is its value.
-    Code(CodeBlock),
+    /// A code block; text is its value. Each piece of text's offset in
+    /// the value and in the source are noted, to find directive content
+    /// in the source.
+    Code(CodeBlock, Vec<(usize, usize)>),
     /// An image; text inside is its alt text.
     Image(Image),
     /// Raw HTML; text is its value.
@@ -98,8 +168,12 @@ enum Frame {
     TableHead(TableRow),
 }
 
-struct Builder {
+struct Builder<'a> {
     document: Document,
+    /// The text being parsed.
+    input: &'a str,
+    /// Declared directives and roles.
+    syntax: &'a Syntax,
     stack: Vec<Frame>,
     diagnostics: Vec<Diagnostic>,
     /// Column alignments of the table being built.
@@ -111,10 +185,12 @@ fn span(range: &Range<usize>) -> Option<Span> {
     Some(Span::new(clamp(range.start), clamp(range.end)))
 }
 
-impl Builder {
-    fn new(source: &str) -> Self {
+impl<'a> Builder<'a> {
+    fn new(source: &str, input: &'a str, syntax: &'a Syntax) -> Self {
         Self {
             document: Document::new(source),
+            input,
+            syntax,
             stack: Vec::new(),
             diagnostics: Vec::new(),
             aligns: Vec::new(),
@@ -159,7 +235,10 @@ impl Builder {
             return;
         }
         match self.stack.last_mut() {
-            Some(Frame::Code(code)) => code.value.push_str(value),
+            Some(Frame::Code(code, pieces)) => {
+                pieces.push((code.value.len(), range.start));
+                code.value.push_str(value);
+            }
             Some(Frame::Html(raw)) => raw.value.push_str(value),
             Some(Frame::Metadata(_, _, buf)) => buf.push_str(value),
             _ => self.push(Node::Text(Text {
@@ -180,10 +259,25 @@ impl Builder {
             Event::Text(t) => self.text(&t, &range),
             Event::Code(code) => match self.image_alt() {
                 Some(alt) => alt.push_str(&code),
-                None => self.push(Node::InlineCode(InlineCode {
-                    span: span(&range),
-                    value: code.into_string(),
-                })),
+                None => match self.role_name(range.start) {
+                    Some((name, start)) => {
+                        let span = span(&(start..range.end));
+                        let value = code.into_string();
+                        self.push(Node::Custom(Custom {
+                            span,
+                            kind: "role".into(),
+                            attrs: BTreeMap::from([
+                                ("name".into(), Value::String(name)),
+                                ("text".into(), Value::String(value.clone())),
+                            ]),
+                            children: vec![Node::Text(Text { span, value })],
+                        }));
+                    }
+                    None => self.push(Node::InlineCode(InlineCode {
+                        span: span(&range),
+                        value: code.into_string(),
+                    })),
+                },
             },
             Event::Html(html) | Event::InlineHtml(html) => match self.stack.last_mut() {
                 Some(Frame::Html(raw)) => raw.value.push_str(&html),
@@ -281,12 +375,15 @@ impl Builder {
                     }
                     CodeBlockKind::Indented => (None, None),
                 };
-                Frame::Code(CodeBlock {
-                    span,
-                    language,
-                    info,
-                    value: String::new(),
-                })
+                Frame::Code(
+                    CodeBlock {
+                        span,
+                        language,
+                        info,
+                        value: String::new(),
+                    },
+                    Vec::new(),
+                )
             }
             Tag::HtmlBlock => Frame::Html(Raw {
                 span,
@@ -396,7 +493,10 @@ impl Builder {
                     self.push(node);
                 }
             }
-            Frame::Code(code) => self.push(Node::CodeBlock(code)),
+            Frame::Code(code, pieces) => {
+                let node = self.code_or_directive(code, &pieces);
+                self.push(node);
+            }
             Frame::Image(image) => self.push(Node::Image(image)),
             Frame::Html(raw) => self.push(Node::Raw(raw)),
             Frame::TableHead(row) => self.push(Node::TableRow(row)),
@@ -427,13 +527,191 @@ impl Builder {
     }
 
     fn warn(&mut self, span: Span, message: String) {
+        self.warn_with(Some(span), message, "front-matter");
+    }
+
+    fn warn_with(&mut self, span: Option<Span>, message: String, code: &str) {
         self.diagnostics.push(Diagnostic {
             severity: Severity::Warning,
             message,
             source: Some(self.document.source.clone()),
-            span: Some(span),
-            code: Some("front-matter".into()),
+            span,
+            code: Some(code.into()),
         });
+    }
+
+    /// If the inline code starting at `start` follows a declared role's
+    /// `{name}`, removes that from the text before it and returns the
+    /// role's name and where its `{` is.
+    fn role_name(&mut self, start: usize) -> Option<(String, usize)> {
+        let syntax = self.syntax;
+        let children = match self.stack.last_mut() {
+            Some(Frame::Node(parent)) => parent.children_mut()?,
+            Some(Frame::TableHead(row)) => &mut row.children,
+            _ => return None,
+        };
+        let Some(Node::Text(text)) = children.last_mut() else {
+            return None;
+        };
+        let end = text.span?.end as usize;
+        if end != start {
+            return None;
+        }
+        let rest = text.value.strip_suffix('}')?;
+        let open = rest.rfind('{')?;
+        let name = &rest[open + 1..];
+        if !is_name(name) || !syntax.has_role(&name.to_lowercase()) {
+            return None;
+        }
+        let name = name.to_lowercase();
+        let len = text.value.len() - open;
+        let brace = start - len;
+        text.value.truncate(open);
+        if let Some(s) = &mut text.span {
+            s.end = u32::try_from(brace).unwrap_or(s.end);
+        }
+        if text.value.is_empty() {
+            children.pop();
+        }
+        Some((name, brace))
+    }
+
+    /// A fenced code block, or a directive if its language is `{name}`.
+    fn code_or_directive(&mut self, code: CodeBlock, pieces: &[(usize, usize)]) -> Node {
+        let Some(name) = code
+            .language
+            .as_deref()
+            .and_then(|l| l.strip_prefix('{')?.strip_suffix('}'))
+            .filter(|n| is_name(n))
+            .map(str::to_lowercase)
+        else {
+            return Node::CodeBlock(code);
+        };
+        let at = code.span.map(|s| s.start);
+        // Where the value's offsets are in the source.
+        let source_offset = |offset: usize| -> u32 {
+            let found = pieces.iter().rev().find(|(value, _)| *value <= offset);
+            let n = match found {
+                Some((value, source)) => source + (offset - value),
+                None => at.map_or(0, |a| a as usize),
+            };
+            u32::try_from(n).unwrap_or(u32::MAX)
+        };
+        let argument = code.info.clone().unwrap_or_default();
+        let (options, body_start, options_error) = directive_options(&code.value);
+        let body = code.value[body_start..].trim_end_matches('\n');
+        let syntax = self.syntax;
+        let mut attrs = BTreeMap::new();
+        if !argument.is_empty() {
+            attrs.insert("argument".to_owned(), Value::String(argument.clone()));
+        }
+        let mut children = Vec::new();
+        let span = code.span;
+        if let Some(error) = options_error {
+            self.warn_with(span, format!("directive \"{name}\": {error}"), "directive");
+        }
+        let Some(declared) = syntax.directive(&name) else {
+            // Not declared: kept as text, as reStructuredText keeps
+            // unknown directives.
+            let options: serde_json::Map<String, Value> = options
+                .into_iter()
+                .map(|(k, v)| (k, Value::String(v.unwrap_or_default())))
+                .collect();
+            if !options.is_empty() {
+                attrs.insert("options".to_owned(), Value::Object(options));
+            }
+            if !body.is_empty() {
+                attrs.insert("content".to_owned(), Value::String(body.to_owned()));
+            }
+            return Node::Custom(Custom {
+                span,
+                kind: name,
+                attrs,
+                children,
+            });
+        };
+        let mut problems = Vec::new();
+        check_arguments(declared, &argument, &mut problems);
+        let mut values = serde_json::Map::new();
+        for (key, value) in options {
+            match (declared.options.get(&key), value) {
+                (None, _) => problems.push(format!("unknown option: \"{key}\"")),
+                (Some(OptionSyntax::Flag), Some(v)) if !v.is_empty() => {
+                    problems.push(format!("option \"{key}\" takes no value"))
+                }
+                (Some(OptionSyntax::Flag), _) => {
+                    values.insert(key, Value::Bool(true));
+                }
+                (Some(OptionSyntax::Required), None) => {
+                    problems.push(format!("option \"{key}\" needs a value"))
+                }
+                (Some(OptionSyntax::Required), Some(v)) if v.is_empty() => {
+                    problems.push(format!("option \"{key}\" needs a value"))
+                }
+                (Some(_), v) => {
+                    values.insert(key, Value::String(v.unwrap_or_default()));
+                }
+            }
+        }
+        if !values.is_empty() {
+            attrs.insert("options".to_owned(), Value::Object(values));
+        }
+        match declared.content {
+            ContentSyntax::None if !body.trim().is_empty() => {
+                problems.push("no content permitted".to_owned());
+            }
+            ContentSyntax::None => {}
+            ContentSyntax::Text => {
+                if !body.is_empty() {
+                    attrs.insert("content".to_owned(), Value::String(body.to_owned()));
+                }
+            }
+            ContentSyntax::Blocks => {
+                let map = |o: u32| source_offset(body_start + o as usize);
+                let (nodes, diagnostics) = parse_piece(&self.document.source, body, syntax, &map);
+                children = nodes;
+                self.diagnostics.extend(diagnostics);
+            }
+        }
+        if declared.argument == ArgumentSyntax::Inline && !argument.is_empty() {
+            // The argument is on the fence line, after `{name}`.
+            let line_start = span.map_or(0, |s| s.start as usize);
+            let line = self.input[line_start.min(self.input.len())..]
+                .lines()
+                .next()
+                .unwrap_or_default();
+            let offset = line.find(argument.as_str()).map_or(0, |i| line_start + i);
+            let map = |o: u32| u32::try_from(offset).unwrap_or(0).saturating_add(o);
+            let (nodes, diagnostics) = parse_piece(&self.document.source, &argument, syntax, &map);
+            self.diagnostics.extend(diagnostics);
+            let inlines = match nodes.into_iter().next() {
+                Some(Node::Paragraph(p)) => p.children,
+                _ => Vec::new(),
+            };
+            let end = offset + argument.len();
+            children.insert(
+                0,
+                Node::Custom(Custom {
+                    span: Some(Span::new(map(0), u32::try_from(end).unwrap_or(0))),
+                    kind: "directive_argument".into(),
+                    attrs: BTreeMap::new(),
+                    children: inlines,
+                }),
+            );
+        }
+        for problem in problems {
+            self.warn_with(
+                span,
+                format!("directive \"{name}\": {problem}"),
+                "directive",
+            );
+        }
+        Node::Custom(Custom {
+            span,
+            kind: name,
+            attrs,
+            children,
+        })
     }
 
     fn finish(mut self) -> (Document, Vec<Diagnostic>) {
@@ -444,6 +722,108 @@ impl Builder {
         let children = std::mem::take(&mut self.document.children);
         self.document.children = sectionize(children);
         (self.document, self.diagnostics)
+    }
+}
+
+/// Whether `name` can be a directive or role name: letters, digits and
+/// `-`, `_`, `:`, `.`, `+`, starting with a letter or digit.
+fn is_name(name: &str) -> bool {
+    name.chars().next().is_some_and(char::is_alphanumeric)
+        && name
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | ':' | '.' | '+'))
+}
+
+/// Directive options as written: names and values (`None` for none).
+type OptionList = Vec<(String, Option<String>)>;
+
+/// A directive's options at the start of its fence's text: `:name: value`
+/// lines, or a YAML mapping between `---` lines. Returns them (`None` for
+/// no value), where the content starts (after one blank line), and a
+/// problem with them, if any.
+fn directive_options(text: &str) -> (OptionList, usize, Option<String>) {
+    let mut options = Vec::new();
+    let mut pos = 0;
+    let mut lines = text.split_inclusive('\n').peekable();
+    let mut error = None;
+    if lines.peek().is_some_and(|l| l.trim_end() == "---") {
+        let first = lines.next().unwrap_or_default();
+        let mut yaml = String::new();
+        let mut end = None;
+        let mut at = first.len();
+        for line in lines.by_ref() {
+            at += line.len();
+            if line.trim_end() == "---" {
+                end = Some(at);
+                break;
+            }
+            yaml.push_str(line);
+        }
+        match end {
+            Some(end) => {
+                pos = end;
+                match serde_saphyr::from_str::<Value>(&yaml) {
+                    Ok(Value::Object(map)) => {
+                        for (key, value) in map {
+                            let value = match value {
+                                Value::Null | Value::Bool(true) => None,
+                                Value::String(s) => Some(s),
+                                other => Some(other.to_string()),
+                            };
+                            options.push((key, value));
+                        }
+                    }
+                    Ok(Value::Null) => {}
+                    Ok(_) => error = Some("options must be a mapping".to_owned()),
+                    Err(e) => error = Some(format!("invalid options: {e}")),
+                }
+            }
+            None => return (options, 0, None),
+        }
+    } else {
+        for line in lines.by_ref() {
+            let Some(rest) = line.trim_end().strip_prefix(':') else {
+                break;
+            };
+            let Some((key, value)) = rest.split_once(':') else {
+                break;
+            };
+            if key.is_empty() || key.contains(char::is_whitespace) {
+                break;
+            }
+            let value = value.trim();
+            options.push((
+                key.to_owned(),
+                (!value.is_empty()).then(|| value.to_owned()),
+            ));
+            pos += line.len();
+        }
+    }
+    // One blank line may separate options from content.
+    if !options.is_empty()
+        && let Some(line) = text[pos..].split_inclusive('\n').next()
+        && line.trim().is_empty()
+    {
+        pos += line.len();
+    }
+    (options, pos, error)
+}
+
+/// Problems with a directive's argument against its declaration.
+fn check_arguments(declared: &DirectiveSyntax, argument: &str, problems: &mut Vec<String>) {
+    let most = declared.required_arguments + declared.optional_arguments;
+    let words = argument.split_whitespace().count();
+    if words < declared.required_arguments as usize {
+        problems.push(format!(
+            "{} argument(s) required, {words} supplied",
+            declared.required_arguments
+        ));
+    } else if most == 0 && words > 0 {
+        problems.push("no arguments permitted".to_owned());
+    } else if !declared.final_argument_whitespace && words > most as usize {
+        problems.push(format!(
+            "maximum {most} argument(s) allowed, {words} supplied"
+        ));
     }
 }
 
@@ -670,6 +1050,127 @@ mod tests {
             _ => None,
         });
         assert_eq!(label, Some("n"));
+    }
+
+    fn syntax() -> Syntax {
+        serde_json::from_value(json!({
+            "directives": [
+                {"name": "versionadded", "required_arguments": 1,
+                 "final_argument_whitespace": true,
+                 "options": {"class": "value", "hidden": "flag"}, "content": "blocks"},
+                {"name": "centered", "required_arguments": 1,
+                 "final_argument_whitespace": true, "argument": "inline"},
+                {"name": "code-block", "optional_arguments": 1, "content": "text"},
+            ],
+            "roles": [{"name": "kbd"}],
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn declared_directives_and_roles_become_custom_nodes() {
+        let input = "```{versionadded} 1.2 beta\n:class: x\n:hidden:\n\n*New* here.\n```\n\n\
+                     ```{centered} Hello *world*\n```\n\n\
+                     ```{code-block} rust\nfn main() {}\n```\n\n\
+                     Press {kbd}`Ctrl+C` or `code`.\n";
+        let (doc, diagnostics) = parse_with_syntax("t.md", input, &syntax());
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let value = serde_json::to_value(&doc.children).unwrap();
+        assert_eq!(value[0]["kind"], "versionadded");
+        assert_eq!(
+            value[0]["attrs"],
+            json!({"argument": "1.2 beta", "options": {"class": "x", "hidden": true}})
+        );
+        // Content is parsed, with spans in the file.
+        let Node::Custom(added) = &doc.children[0] else {
+            panic!()
+        };
+        assert_eq!(at(input, &added.children[0]), "*New* here.");
+        assert_eq!(at(input, &added.children[0].children()[0]), "*New*");
+        assert_eq!(value[1]["kind"], "centered");
+        let Node::Custom(centered) = &doc.children[1] else {
+            panic!()
+        };
+        let argument = &centered.children[0];
+        assert_eq!(value[1]["children"][0]["kind"], "directive_argument");
+        assert_eq!(at(input, argument), "Hello *world*");
+        assert_eq!(at(input, &argument.children()[1]), "*world*");
+        assert_eq!(
+            value[2]["attrs"],
+            json!({"argument": "rust", "content": "fn main() {}"})
+        );
+        let para = &doc.children[3];
+        let kinds: Vec<_> = para.children().iter().map(|n| n.kind()).collect();
+        assert_eq!(
+            kinds,
+            ["text", "custom:role", "text", "inline_code", "text"]
+        );
+        assert_eq!(at(input, &para.children()[1]), "{kbd}`Ctrl+C`");
+        assert_eq!(
+            value[3]["children"][1]["attrs"],
+            json!({"name": "kbd", "text": "Ctrl+C"})
+        );
+        assert_eq!(plain_text_of(para), "Press Ctrl+C or code.");
+    }
+
+    fn plain_text_of(node: &Node) -> String {
+        lsdocs_plugin_sdk::doctree::plain_text(node.children())
+    }
+
+    #[test]
+    fn directive_options_in_yaml_and_problems() {
+        let input = "```{versionadded} 2\n---\nclass: big\nhidden: true\n---\nText.\n```\n";
+        let (doc, diagnostics) = parse_with_syntax("t.md", input, &syntax());
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let value = serde_json::to_value(&doc.children[0]).unwrap();
+        assert_eq!(
+            value["attrs"]["options"],
+            json!({"class": "big", "hidden": true})
+        );
+        assert_eq!(value["children"][0]["type"], "paragraph");
+        let input = "```{versionadded}\n:nope: 1\n:hidden: yes\n```\n";
+        let (_, diagnostics) = parse_with_syntax("t.md", input, &syntax());
+        let messages: Vec<_> = diagnostics.iter().map(|d| d.message.as_str()).collect();
+        assert_eq!(
+            messages,
+            [
+                "directive \"versionadded\": 1 argument(s) required, 0 supplied",
+                "directive \"versionadded\": unknown option: \"nope\"",
+                "directive \"versionadded\": option \"hidden\" takes no value",
+            ]
+        );
+        assert!(diagnostics.iter().all(|d| d.span.is_some()));
+    }
+
+    #[test]
+    fn undeclared_directives_and_roles() {
+        let input = "```{mermaid} arg\n:theme: dark\n\ngraph TD; A-->B\n```\n\n{kbd}`x`\n";
+        let doc = parse_ok(input);
+        let value = serde_json::to_value(&doc.children).unwrap();
+        assert_eq!(value[0]["kind"], "mermaid");
+        assert_eq!(
+            value[0]["attrs"],
+            json!({"argument": "arg", "options": {"theme": "dark"}, "content": "graph TD; A-->B"})
+        );
+        let kinds: Vec<_> = doc.children[1]
+            .children()
+            .iter()
+            .map(|n| n.kind())
+            .collect();
+        assert_eq!(kinds, ["text", "inline_code"]);
+    }
+
+    #[test]
+    fn directives_nest_in_containers() {
+        let input = "> ```{versionadded} 1\n> Inside **quote**.\n> ```\n";
+        let (doc, diagnostics) = parse_with_syntax("t.md", input, &syntax());
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let quote = &doc.children[0];
+        let Node::Custom(added) = &quote.children()[0] else {
+            panic!("{doc:?}")
+        };
+        let strong = &added.children[0].children()[1];
+        assert_eq!(at(input, strong), "**quote**");
     }
 
     #[test]
