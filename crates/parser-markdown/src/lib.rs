@@ -70,6 +70,7 @@ impl Parser for Markdown {
         Ok(ParseResult {
             document,
             diagnostics,
+            dependencies: Vec::new(),
         })
     }
 }
