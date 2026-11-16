@@ -483,14 +483,14 @@ fn sectionize(nodes: Vec<Node>) -> Vec<Node> {
                 {
                     close(&mut open, &mut out);
                 }
-                let section = Section {
+                let level = heading.level;
+                let mut section = Section {
                     span: heading.span,
                     id: heading.id.take(),
                     children: vec![],
                 };
-                open.push((heading.level, section));
-                let (_, section) = open.last_mut().expect("just pushed");
-                add(section, Node::Heading(heading));
+                add(&mut section, Node::Heading(heading));
+                open.push((level, section));
             }
             node => match open.last_mut() {
                 Some((_, section)) => add(section, node),
@@ -506,6 +506,7 @@ fn sectionize(nodes: Vec<Node>) -> Vec<Node> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::panic)]
     use super::*;
     use serde_json::json;
 
