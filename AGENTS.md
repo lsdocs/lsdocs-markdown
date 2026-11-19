@@ -43,3 +43,13 @@ shows them. `nur ci` runs what CI runs: run it before committing. Tools:
 - Licensing: `Apache-2.0 OR MIT`. Nothing is published.
 - Record what is left open in README.md's TODO section, and what the code
   does not do (or does differently) under Known limitations.
+
+## This repository
+
+| Path | What |
+|---|---|
+| `crates/parser-markdown` | `lsdocs-parser-markdown`: the Markdown parser plugin. |
+
+It produces the shared document shape (nested sections, explicit ids
+only, core node kinds; see "Document shape" in lsdocs-protocol's
+`spec/wire.md`); the host generates ids and link targets after parsing.
