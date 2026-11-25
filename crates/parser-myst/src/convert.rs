@@ -1,9 +1,9 @@
 //! markdown-it's syntax tree to lsdocs' document shape.
 
 use lsdocs_plugin_sdk::doctree::{
-    Align, BlockQuote, CodeBlock, Document, Emphasis, Heading, Image, InlineCode, LineBreak, Link,
-    List, ListItem, Metadata, Node, Paragraph, Raw, Section, Span, Strong, Table, TableCell,
-    TableRow, Text, ThematicBreak, Value,
+    Admonition, Align, BlockQuote, CodeBlock, Document, Emphasis, Heading, Image, InlineCode,
+    LineBreak, Link, List, ListItem, Metadata, Node, Paragraph, Raw, Section, Span, Strong, Table,
+    TableCell, TableRow, Text, ThematicBreak, Value,
 };
 use lsdocs_plugin_sdk::protocol::{Diagnostic, Severity};
 use markdown_it::Node as MdNode;
@@ -32,6 +32,7 @@ use markdown_it::plugins::extra::tasklist::TaskListMarker;
 use markdown_it::plugins::html::html_block::HtmlBlock;
 use markdown_it::plugins::html::html_inline::HtmlInline;
 
+use crate::plugins::deflist::{DefinitionDescription, DefinitionList, DefinitionTerm};
 use crate::plugins::footnote::{FootnoteDefinition, FootnoteReference};
 use crate::plugins::math::Math;
 
@@ -121,10 +122,14 @@ impl Converter<'_> {
         } else if let Some(h) = node.cast::<SetextHeader>() {
             self.heading(node, h.level)
         } else if node.is::<Blockquote>() {
-            Node::BlockQuote(BlockQuote {
-                span: self.block_span(node),
-                children: self.nodes(&node.children),
-            })
+            if let Some(alert) = self.alert(node) {
+                alert
+            } else {
+                Node::BlockQuote(BlockQuote {
+                    span: self.block_span(node),
+                    children: self.nodes(&node.children),
+                })
+            }
         } else if node.is::<MdThematicBreak>() {
             Node::ThematicBreak(ThematicBreak {
                 span: self.block_span(node),
@@ -238,6 +243,32 @@ impl Converter<'_> {
                 display: m.display,
                 value: m.value.clone(),
             })
+        } else if node.is::<DefinitionList>() {
+            Node::DefinitionList(lsdocs_plugin_sdk::doctree::DefinitionList {
+                span: self.block_span(node),
+                children: self.nodes(&node.children),
+            })
+        } else if node.is::<DefinitionTerm>() {
+            Node::DefinitionTerm(lsdocs_plugin_sdk::doctree::DefinitionTerm {
+                span: self.block_span(node),
+                children: self.nodes(&node.children),
+            })
+        } else if node.is::<DefinitionDescription>() {
+            // Tight: a paragraph's inlines are the description's own.
+            let mut children = Vec::new();
+            for child in &node.children {
+                if child.is::<MdParagraph>() {
+                    for inline in &child.children {
+                        self.node(inline, &mut children);
+                    }
+                } else {
+                    self.node(child, &mut children);
+                }
+            }
+            Node::DefinitionDescription(lsdocs_plugin_sdk::doctree::DefinitionDescription {
+                span: self.block_span(node),
+                children,
+            })
         } else if let Some(table) = node.cast::<MdTable>() {
             self.table(node, table)
         } else if node.is::<MdTableRow>() {
@@ -258,12 +289,61 @@ impl Converter<'_> {
     }
 
     fn heading(&mut self, node: &MdNode, level: u8) -> Node {
+        let mut children = self.nodes(&node.children);
+        let id = heading_id(&mut children);
         Node::Heading(Heading {
             span: self.block_span(node),
             level,
-            id: None,
-            children: self.nodes(&node.children),
+            id,
+            children,
         })
+    }
+
+    /// A GitHub alert: a block quote whose first line is `[!KIND]`, as an
+    /// admonition without that line.
+    fn alert(&mut self, node: &MdNode) -> Option<Node> {
+        let first = node.children.first().filter(|p| p.is::<MdParagraph>())?;
+        let mut marker = String::new();
+        let mut rest = first.children.len();
+        for (i, inline) in first.children.iter().enumerate() {
+            if inline.is::<Softbreak>() {
+                rest = i + 1;
+                break;
+            }
+            if let Some(text) = inline.cast::<MdText>() {
+                marker.push_str(&text.content);
+            } else {
+                marker.push_str(&inline.cast::<TextSpecial>()?.content);
+            }
+        }
+        let kind = marker
+            .trim_end()
+            .strip_prefix("[!")?
+            .strip_suffix(']')?
+            .to_lowercase();
+        let kind = ["note", "tip", "important", "warning", "caution"]
+            .into_iter()
+            .find(|k| *k == kind)?;
+        let mut children = Vec::new();
+        let inlines = self.nodes(&first.children[rest..]);
+        if let Some(start) = inlines.first().and_then(Node::span) {
+            let span = self
+                .block_span(first)
+                .map(|s| Span::new(start.start, s.end));
+            children.push(Node::Paragraph(Paragraph {
+                span,
+                children: inlines,
+            }));
+        }
+        for child in &node.children[1..] {
+            self.node(child, &mut children);
+        }
+        Some(Node::Admonition(Admonition {
+            span: self.block_span(node),
+            kind: kind.into(),
+            title: None,
+            children,
+        }))
     }
 
     fn table(&mut self, node: &MdNode, table: &MdTable) -> Node {
@@ -367,6 +447,35 @@ fn text_node(span: Option<Span>, value: &str) -> Node {
         span,
         value: value.to_owned(),
     })
+}
+
+/// Takes a trailing `{#id ...}` off a heading's text: the id, if any.
+/// Other attributes (`.class`, `key=value`) are dropped.
+fn heading_id(children: &mut Vec<Node>) -> Option<String> {
+    let Some(Node::Text(text)) = children.last_mut() else {
+        return None;
+    };
+    let trimmed = text.value.trim_end();
+    let open = trimmed.strip_suffix('}')?.rfind('{')?;
+    let attrs = &trimmed[open + 1..trimmed.len() - 1];
+    let mut id = None;
+    for attr in attrs.split_whitespace() {
+        if let Some(value) = attr.strip_prefix('#') {
+            id = Some(value.to_owned());
+        } else if !attr.starts_with('.') && !attr.contains('=') {
+            return None;
+        }
+    }
+    let kept = text.value[..open].trim_end().len();
+    let removed = text.value.len() - kept;
+    text.value.truncate(kept);
+    if let Some(span) = &mut text.span {
+        span.end = span.end.saturating_sub(u32::try_from(removed).unwrap_or(0));
+    }
+    if text.value.is_empty() {
+        children.pop();
+    }
+    id
 }
 
 /// A fence's info string as language and the rest.

@@ -898,6 +898,19 @@ mod tests {
         }
     }
 
+    #[test]
+    fn same_definitions_alerts_ids() {
+        for input in [
+            "> [!WARNING]\n> Careful.\n\nTerm\n: Meaning\n",
+            "intro\n\n# A\n\na\n\n## B {#bee}\n\n#### D\n\n### C\n\n# E\n\n> ## Quoted\n",
+            "# T {#top}\n",
+            "> [!note]\n> lower\n",
+            "Term\n: One\n: Two\n\nOther\n: Def\n",
+        ] {
+            same(input);
+        }
+    }
+
     fn parse_ok(input: &str) -> Document {
         let (doc, diagnostics) = parse("t.md", input);
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
