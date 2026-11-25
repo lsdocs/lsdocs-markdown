@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Dialects as features, all on by default (at least one is required),
+  each its own plugin: `md-vanilla` (`parser-md-vanilla`, Markdown as
+  pulldown-cmark reads it, with a `smart-punctuation` setting, off by
+  default) and `myst` (`parser-myst`, from `lsdocs-parser-myst`).
+
+### Removed
+
+- The `parser-markdown` plugin: sites name `parser-myst` (same output)
+  or `parser-md-vanilla`.
+
 ## [0.1.0](https://github.com/lsdocs/lsdocs-markdown/releases/tag/lsdocs-parser-markdown/v0.1.0) - 2026-11-22
 
 ### Added

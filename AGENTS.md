@@ -51,8 +51,12 @@ shows them. `nur ci` runs what CI runs: run it before committing. Tools:
 
 | Path | What |
 |---|---|
-| `crates/parser-markdown` | `lsdocs-parser-markdown`: the Markdown parser plugin. |
+| `crates/parser-markdown` | `lsdocs-parser-markdown`: the Markdown parser plugins, one per dialect, each behind a feature (all on by default; at least one required). `md-vanilla` (`src/vanilla.rs`, plugin `parser-md-vanilla`) is here; `myst` re-exports `lsdocs-parser-myst`. |
+| `crates/parser-myst` | `lsdocs-parser-myst`: the MyST dialect (plugin `parser-myst`). |
 
-It produces the shared document shape (nested sections, explicit ids
+A crate that cannot build without default features lists the features
+`nur msrv` checks it with in `[package.metadata.lsdocs] msrv-features`.
+
+Each dialect produces the shared document shape (nested sections, explicit ids
 only, core node kinds; see "Document shape" in lsdocs-protocol's
 `spec/wire.md`); the host generates ids and link targets after parsing.

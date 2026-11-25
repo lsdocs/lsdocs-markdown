@@ -27,3 +27,8 @@ toml = { workspace = true, optional = true }
 
 [dev-dependencies]
 serde_json.workspace = true
+
+# `nur msrv` checks this crate with these features (it cannot build
+# without a dialect).
+[package.metadata.lsdocs]
+msrv-features = ["md-vanilla"]
