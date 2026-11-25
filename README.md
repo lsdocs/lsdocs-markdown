@@ -10,7 +10,7 @@ enabled); a site lists the plugin of the dialect it is written in.
 
 | Feature | Plugin | Dialect |
 |---|---|---|
-| `md-vanilla` | `parser-md-vanilla` | Markdown as the `pulldown-cmark` library reads it: CommonMark with GitHub tables, task lists and alerts, footnotes, definition lists, math, explicit heading ids and YAML/TOML front matter. Setting: `smart-punctuation` (off by default). |
+| `pulldown-cmark` | `parser-pulldown-cmark` | Markdown as the `pulldown-cmark` library reads it: CommonMark with GitHub tables, task lists and alerts, footnotes, definition lists, math, explicit heading ids and YAML/TOML front matter. Setting: `smart-punctuation` (off by default). |
 | `myst` | `parser-myst` | The same, plus syntax extensions (directives and roles) in MyST's syntax: ```` ```{name} ```` fences and `` {name}`text` `` roles. From `crates/parser-myst` (`lsdocs-parser-myst`). |
 
 Settings go in `.config/lsdocs/<name>/settings.toml`, `name` being the
