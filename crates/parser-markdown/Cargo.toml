@@ -11,10 +11,19 @@ repository.workspace = true
 workspace = true
 
 [features]
-default = ["myst"]
+default = ["md-vanilla", "myst"]
 # Each dialect is its own lsdocs plugin; at least one must be enabled.
+# The pulldown-cmark library's Markdown (`parser-md-vanilla`).
+md-vanilla = ["dep:lsdocs-plugin-sdk", "dep:pulldown-cmark", "dep:serde-saphyr", "dep:toml"]
 # MyST (`parser-myst`), from `lsdocs-parser-myst`.
 myst = ["dep:lsdocs-parser-myst"]
 
 [dependencies]
 lsdocs-parser-myst = { workspace = true, optional = true }
+lsdocs-plugin-sdk = { workspace = true, optional = true }
+pulldown-cmark = { workspace = true, optional = true }
+serde-saphyr = { workspace = true, optional = true }
+toml = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde_json.workspace = true
