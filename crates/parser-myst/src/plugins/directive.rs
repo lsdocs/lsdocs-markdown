@@ -212,7 +212,9 @@ impl BlockRule for DirectiveScanner {
         if declared.argument == ArgumentSyntax::Inline && !open.argument.is_empty() {
             let line_start = state.line_offsets[start].first_nonspace;
             let line = state.get_line(start);
-            let at = line_start + line.find(open.argument.as_str()).unwrap_or(0);
+            // After `{name}`, not inside it.
+            let after = line.find('}').map_or(0, |i| i + 1);
+            let at = line_start + after + line[after..].find(open.argument.as_str()).unwrap_or(0);
             let mut argument = Node::new(DirectiveArgument);
             argument.children.push(Node::new(InlineRoot::new(
                 open.argument.clone(),

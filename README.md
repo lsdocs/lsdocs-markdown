@@ -27,6 +27,13 @@ smart-punctuation = true
 - `parser-myst` has no `smart-punctuation` setting.
 - `parser-myst` reads only part of MyST's syntax: no substitutions,
   `{attrs}`, `$$` equation labels, `%` comments or `+++` block breaks.
+- `parser-myst` works around bugs in `markdown-it-rs` 0.7 (fixed on its
+  unreleased main branch): `\r\n` line endings are read as `\n` (spans
+  still point into the file); spans its source maps get wrong (tabs in
+  container indentation, some trailing spaces) are left out; and on the
+  input where its emphasis rule overflows (e.g. tab-indented list
+  continuations), builds with overflow checks report a `parser-failed`
+  error for the file instead of crashing.
 - `parser-myst` keeps pulldown-cmark's quirks where its output did
   (spans, footnote and math syntax), so sites read as before the move to
   markdown-it.

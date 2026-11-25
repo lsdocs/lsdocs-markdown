@@ -32,11 +32,14 @@
 //!   directives do; other roles stay text and code.
 
 mod convert;
+mod lines;
 mod md;
 mod plugins;
 
 use lsdocs_plugin_sdk::doctree::Document;
-use lsdocs_plugin_sdk::protocol::{Diagnostic, ParseParams, ParseResult, Syntax};
+use std::panic::{AssertUnwindSafe, catch_unwind};
+
+use lsdocs_plugin_sdk::protocol::{Diagnostic, ParseParams, ParseResult, Severity, Syntax};
 use lsdocs_plugin_sdk::{Context, Parser, Plugin, PluginResult};
 
 /// The plugin, as registered with the host.
@@ -79,8 +82,26 @@ pub fn parse_with_syntax(
     input: &str,
     syntax: &Syntax,
 ) -> (Document, Vec<Diagnostic>) {
-    let root = md::parser(syntax).parse(input);
-    convert::document(source, input, &root)
+    let text = lines::normalize(input);
+    let md = md::parser(syntax);
+    // markdown-it-rs 0.7 can overflow on some input (its emphasis rule):
+    // in builds with overflow checks that panics; report it, don't crash.
+    let parsed = catch_unwind(AssertUnwindSafe(|| md.parse(&text.text)));
+    let (mut document, mut diagnostics) = match parsed {
+        Ok(root) => convert::document(source, &text.text, &root),
+        Err(_) => (
+            Document::new(source),
+            vec![Diagnostic {
+                severity: Severity::Error,
+                message: "the Markdown parser (markdown-it-rs) failed on this file".into(),
+                source: Some(source.to_owned()),
+                span: None,
+                code: Some("parser-failed".into()),
+            }],
+        ),
+    };
+    text.map(&mut document, &mut diagnostics);
+    (document, diagnostics)
 }
 
 #[cfg(test)]
@@ -88,7 +109,6 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::panic)]
     use super::*;
     use lsdocs_plugin_sdk::doctree::{Align, Node, Span, Text};
-    use lsdocs_plugin_sdk::protocol::Severity;
     use serde_json::json;
 
     /// The directives of `input`'s first top-level node, as JSON.
@@ -235,6 +255,82 @@ mod tests {
         let (doc, _) = parse_with_syntax("t.md", "{kbd}` a  b `\n", &syntax());
         let value = serde_json::to_value(&doc.children[0].children()[0]).unwrap();
         assert_eq!(value["attrs"]["text"], "a  b");
+    }
+
+    /// Asserts every span in `doc` (and its diagnostics) lies in `input`
+    /// on character boundaries.
+    fn spans_in_input(input: &str, doc: &Document, diagnostics: &[Diagnostic]) {
+        let mut spans: Vec<Span> = doc.descendants().filter_map(Node::span).collect();
+        spans.extend(diagnostics.iter().filter_map(|d| d.span));
+        for s in spans {
+            let (a, b) = (s.start as usize, s.end as usize);
+            assert!(
+                a <= b
+                    && b <= input.len()
+                    && input.is_char_boundary(a)
+                    && input.is_char_boundary(b),
+                "span {a}..{b} outside {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn crlf_reads_as_lf_with_spans_in_the_file() {
+        let input = "*a\r\nb*\r\n";
+        let (doc, diagnostics) = parse("t.md", input);
+        spans_in_input(input, &doc, &diagnostics);
+        assert_eq!(at(input, &doc.children[0].children()[0]), "*a\r\nb*");
+        let input = "# T\r\n\r\npara\r\n";
+        let doc = parse_ok(input);
+        let Node::Section(section) = &doc.children[0] else {
+            panic!("{doc:?}")
+        };
+        assert_eq!(at(input, &section.children[0]), "# T\r\n");
+        assert_eq!(at(input, &section.children[1]), "para\r\n");
+    }
+
+    #[test]
+    fn spans_stay_in_the_file() {
+        for input in [
+            "- *x*\n\ta*b*\n",
+            "- *`*\n\ta",
+            ">\t:",
+            "- \n\t:\n",
+            "Intro paragraph here.\n\nword \n*x*\n",
+            "*\u{e9}\r\n]*",
+        ] {
+            let (doc, diagnostics) = parse("t.md", input);
+            spans_in_input(input, &doc, &diagnostics);
+        }
+    }
+
+    #[test]
+    fn inline_argument_span_is_the_argument() {
+        let input = "```{centered} e\n```\n";
+        let (doc, _) = parse_with_syntax("t.md", input, &syntax());
+        let argument = &doc.children[0].children()[0];
+        assert_eq!(argument.span(), Some(Span::new(14, 15)));
+    }
+
+    #[test]
+    fn lazy_lines_continue_footnotes_and_definitions() {
+        let doc = parse_ok("x[^n]\n\n[^n]: a\nb\n");
+        assert_eq!(doc.children.len(), 2, "{doc:?}");
+        assert_eq!(plain(doc.children[1].children()), "a\nb");
+        let doc = parse_ok("Term\n: def\nlazy\n");
+        assert_eq!(doc.children.len(), 1, "{doc:?}");
+        assert_eq!(plain(&doc.children[0].children()[1..]), "def\nlazy");
+    }
+
+    #[test]
+    fn unclosed_math_and_footnotes_are_linear() {
+        let started = std::time::Instant::now();
+        parse_ok(&"$x [^a ".repeat(30_000));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     fn parse_ok(input: &str) -> Document {

@@ -1,6 +1,6 @@
 //! Definition lists, as pulldown-cmark reads them: a one-line term, then
 //! one or more `: definition` lines (later lines of a definition indented
-//! at least two spaces). A term after blank lines, followed by a
+//! at least two spaces, or lazy paragraph continuation lines). A term after blank lines, followed by a
 //! definition, continues the list.
 
 use markdown_it::common::sourcemap::SourcePos;
@@ -88,7 +88,8 @@ impl BlockRule for DefinitionListScanner {
                 while end < state.line_max
                     && !state.is_empty(end)
                     && definition(state, end).is_none()
-                    && state.line_indent(end) >= 2
+                    && !term(state, end)
+                    && (state.line_indent(end) >= 2 || super::lazy(state, end))
                 {
                     end += 1;
                 }

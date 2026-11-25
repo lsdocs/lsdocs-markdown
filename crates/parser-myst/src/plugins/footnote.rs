@@ -1,12 +1,12 @@
 //! Footnotes, as pulldown-cmark reads them: `[^label]` references to a
 //! label defined in the document, and `[^label]: ...` definitions, whose
-//! later blocks are indented four spaces. Definitions stay where they are
+//! later blocks are indented four spaces (or lazily continue a paragraph). Definitions stay where they are
 //! written.
 
 use std::collections::HashSet;
 
 use markdown_it::parser::block::{BlockRule, BlockState};
-use markdown_it::parser::extset::RootExt;
+use markdown_it::parser::extset::{InlineRootExt, RootExt};
 use markdown_it::parser::inline::{InlineRule, InlineState};
 use markdown_it::plugins::cmark::block::reference::ReferenceScanner;
 use markdown_it::{MarkdownIt, Node, NodeValue};
@@ -76,7 +76,7 @@ impl BlockRule for DefinitionScanner {
         let mut line = end_line;
         while line < state.line_max {
             if !state.is_empty(line) {
-                if state.line_indent(line) < INDENT {
+                if state.line_indent(line) < INDENT && !super::lazy(state, line) {
                     break;
                 }
                 end_line = line + 1;
@@ -118,13 +118,32 @@ impl DefinitionScanner {
     }
 }
 
+/// From where on (for an end) no `]` follows in this inline text, so
+/// `[^` there is no reference: keeps unclosed `[^` linear.
+#[derive(Debug, Default)]
+struct NoClose(Option<(usize, usize)>);
+
+impl InlineRootExt for NoClose {}
+
 struct ReferenceInline;
 
 impl InlineRule for ReferenceInline {
     const MARKER: char = '[';
 
     fn run(state: &mut InlineState) -> Option<(Node, usize)> {
-        let (label, len) = label(&state.src[state.pos..state.pos_max])?;
+        if let Some((from, max)) = state.inline_ext.get::<NoClose>().and_then(|n| n.0)
+            && state.pos >= from
+            && state.pos_max == max
+        {
+            return None;
+        }
+        let text = &state.src[state.pos..state.pos_max];
+        if text.starts_with("[^") && !text.contains(']') {
+            let (pos, max) = (state.pos, state.pos_max);
+            state.inline_ext.get_or_insert_default::<NoClose>().0 = Some((pos, max));
+            return None;
+        }
+        let (label, len) = label(text)?;
         let defined = state.root_ext.get::<Defined>()?;
         if !defined.0.contains(&label.to_lowercase()) {
             return None;
