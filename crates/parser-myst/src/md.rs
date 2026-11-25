@@ -4,10 +4,10 @@ use lsdocs_plugin_sdk::protocol::Syntax;
 use markdown_it::MarkdownIt;
 use markdown_it::plugins::{cmark, extra, html};
 
-use crate::plugins::{deflist, footnote, math};
+use crate::plugins::{deflist, directive, footnote, math, role};
 
 /// A parser for `syntax`'s directives and roles.
-pub(crate) fn parser(_syntax: &Syntax) -> MarkdownIt {
+pub(crate) fn parser(syntax: &Syntax) -> MarkdownIt {
     let mut md = MarkdownIt::new();
     cmark::add(&mut md);
     html::add(&mut md);
@@ -17,5 +17,7 @@ pub(crate) fn parser(_syntax: &Syntax) -> MarkdownIt {
     footnote::add(&mut md);
     math::add(&mut md);
     deflist::add(&mut md);
+    directive::add(&mut md, syntax);
+    role::add(&mut md);
     md
 }

@@ -1,9 +1,11 @@
 //! markdown-it's syntax tree to lsdocs' document shape.
 
+use std::collections::BTreeMap;
+
 use lsdocs_plugin_sdk::doctree::{
-    Admonition, Align, BlockQuote, CodeBlock, Document, Emphasis, Heading, Image, InlineCode,
-    LineBreak, Link, List, ListItem, Metadata, Node, Paragraph, Raw, Section, Span, Strong, Table,
-    TableCell, TableRow, Text, ThematicBreak, Value,
+    Admonition, Align, BlockQuote, CodeBlock, Custom, Document, Emphasis, Heading, Image,
+    InlineCode, LineBreak, Link, List, ListItem, Metadata, Node, Paragraph, Raw, Section, Span,
+    Strong, Table, TableCell, TableRow, Text, ThematicBreak, Value,
 };
 use lsdocs_plugin_sdk::protocol::{Diagnostic, Severity};
 use markdown_it::Node as MdNode;
@@ -33,8 +35,10 @@ use markdown_it::plugins::html::html_block::HtmlBlock;
 use markdown_it::plugins::html::html_inline::HtmlInline;
 
 use crate::plugins::deflist::{DefinitionDescription, DefinitionList, DefinitionTerm};
+use crate::plugins::directive::{Directive, DirectiveArgument};
 use crate::plugins::footnote::{FootnoteDefinition, FootnoteReference};
 use crate::plugins::math::Math;
+use crate::plugins::role::Role;
 
 /// The document `root` (parsed from `input`) is, plus any problems found.
 pub(crate) fn document(source: &str, input: &str, root: &MdNode) -> (Document, Vec<Diagnostic>) {
@@ -269,6 +273,44 @@ impl Converter<'_> {
                 span: self.block_span(node),
                 children,
             })
+        } else if let Some(d) = node.cast::<Directive>() {
+            let span = self.span(node);
+            if let Some(error) = &d.options_error {
+                let message = format!("directive \"{}\": {error}", d.name);
+                self.warn_with(span, message, "directive");
+            }
+            let mut children = self.nodes(&node.children);
+            if let Some(end) = d.body_end {
+                clamp_ends(&mut children, clamp(end));
+            }
+            for problem in &d.problems {
+                let message = format!("directive \"{}\": {problem}", d.name);
+                self.warn_with(span, message, "directive");
+            }
+            Node::Custom(Custom {
+                span,
+                kind: d.name.clone(),
+                attrs: d.attrs.clone(),
+                children,
+            })
+        } else if node.is::<DirectiveArgument>() {
+            Node::Custom(Custom {
+                span: self.span(node),
+                kind: "directive_argument".into(),
+                attrs: BTreeMap::new(),
+                children: self.nodes(&node.children),
+            })
+        } else if let Some(role) = node.cast::<Role>() {
+            let span = self.span(node);
+            Node::Custom(Custom {
+                span,
+                kind: "role".into(),
+                attrs: BTreeMap::from([
+                    ("name".into(), Value::String(role.name.clone())),
+                    ("text".into(), Value::String(role.text.clone())),
+                ]),
+                children: vec![text_node(span, &role.text)],
+            })
         } else if let Some(table) = node.cast::<MdTable>() {
             self.table(node, table)
         } else if node.is::<MdTableRow>() {
@@ -417,12 +459,16 @@ impl Converter<'_> {
     }
 
     fn warn(&mut self, span: Span, message: String) {
+        self.warn_with(Some(span), message, "front-matter");
+    }
+
+    fn warn_with(&mut self, span: Option<Span>, message: String, code: &str) {
         self.diagnostics.push(Diagnostic {
             severity: Severity::Warning,
             message,
             source: Some(self.document.source.clone()),
-            span: Some(span),
-            code: Some("front-matter".into()),
+            span,
+            code: Some(code.into()),
         });
     }
 }
@@ -440,6 +486,18 @@ fn line_offset(input: &str, line: usize) -> usize {
         .match_indices('\n')
         .nth(line - 1)
         .map_or(input.len(), |(i, _)| i + 1)
+}
+
+/// Ends the spans of `nodes` and their descendants at `end` at the latest.
+fn clamp_ends(nodes: &mut [Node], end: u32) {
+    for node in nodes {
+        if let Some(span) = node.span_mut() {
+            span.end = span.end.min(end);
+        }
+        if let Some(children) = node.children_mut() {
+            clamp_ends(children, end);
+        }
+    }
 }
 
 fn text_node(span: Option<Span>, value: &str) -> Node {

@@ -45,10 +45,11 @@ use lsdocs_plugin_sdk::doctree::{
     Strong, Table, TableCell, TableRow, Text, ThematicBreak, Value,
 };
 use lsdocs_plugin_sdk::protocol::{
-    ArgumentSyntax, ContentSyntax, Diagnostic, DirectiveSyntax, OptionSyntax, ParseParams,
-    ParseResult, Severity, Syntax,
+    ArgumentSyntax, ContentSyntax, Diagnostic, OptionSyntax, ParseParams, ParseResult, Severity,
+    Syntax,
 };
 use lsdocs_plugin_sdk::{Context, Parser, Plugin, PluginResult};
+use plugins::directive::{check_arguments, directive_options, is_name};
 use pulldown_cmark::{
     Alignment, BlockQuoteKind, CodeBlockKind, Event, MetadataBlockKind, Options, Parser as Cmark,
     Tag, TagEnd,
@@ -740,108 +741,6 @@ impl<'a> Builder<'a> {
     }
 }
 
-/// Whether `name` can be a directive or role name: letters, digits and
-/// `-`, `_`, `:`, `.`, `+`, starting with a letter or digit.
-fn is_name(name: &str) -> bool {
-    name.chars().next().is_some_and(char::is_alphanumeric)
-        && name
-            .chars()
-            .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | ':' | '.' | '+'))
-}
-
-/// Directive options as written: names and values (`None` for none).
-type OptionList = Vec<(String, Option<String>)>;
-
-/// A directive's options at the start of its fence's text: `:name: value`
-/// lines, or a YAML mapping between `---` lines. Returns them (`None` for
-/// no value), where the content starts (after one blank line), and a
-/// problem with them, if any.
-fn directive_options(text: &str) -> (OptionList, usize, Option<String>) {
-    let mut options = Vec::new();
-    let mut pos = 0;
-    let mut lines = text.split_inclusive('\n').peekable();
-    let mut error = None;
-    if lines.peek().is_some_and(|l| l.trim_end() == "---") {
-        let first = lines.next().unwrap_or_default();
-        let mut yaml = String::new();
-        let mut end = None;
-        let mut at = first.len();
-        for line in lines.by_ref() {
-            at += line.len();
-            if line.trim_end() == "---" {
-                end = Some(at);
-                break;
-            }
-            yaml.push_str(line);
-        }
-        match end {
-            Some(end) => {
-                pos = end;
-                match serde_saphyr::from_str::<Value>(&yaml) {
-                    Ok(Value::Object(map)) => {
-                        for (key, value) in map {
-                            let value = match value {
-                                Value::Null | Value::Bool(true) => None,
-                                Value::String(s) => Some(s),
-                                other => Some(other.to_string()),
-                            };
-                            options.push((key, value));
-                        }
-                    }
-                    Ok(Value::Null) => {}
-                    Ok(_) => error = Some("options must be a mapping".to_owned()),
-                    Err(e) => error = Some(format!("invalid options: {e}")),
-                }
-            }
-            None => return (options, 0, None),
-        }
-    } else {
-        for line in lines.by_ref() {
-            let Some(rest) = line.trim_end().strip_prefix(':') else {
-                break;
-            };
-            let Some((key, value)) = rest.split_once(':') else {
-                break;
-            };
-            if key.is_empty() || key.contains(char::is_whitespace) {
-                break;
-            }
-            let value = value.trim();
-            options.push((
-                key.to_owned(),
-                (!value.is_empty()).then(|| value.to_owned()),
-            ));
-            pos += line.len();
-        }
-    }
-    // One blank line may separate options from content.
-    if !options.is_empty()
-        && let Some(line) = text[pos..].split_inclusive('\n').next()
-        && line.trim().is_empty()
-    {
-        pos += line.len();
-    }
-    (options, pos, error)
-}
-
-/// Problems with a directive's argument against its declaration.
-fn check_arguments(declared: &DirectiveSyntax, argument: &str, problems: &mut Vec<String>) {
-    let most = declared.required_arguments + declared.optional_arguments;
-    let words = argument.split_whitespace().count();
-    if words < declared.required_arguments as usize {
-        problems.push(format!(
-            "{} argument(s) required, {words} supplied",
-            declared.required_arguments
-        ));
-    } else if most == 0 && words > 0 {
-        problems.push("no arguments permitted".to_owned());
-    } else if !declared.final_argument_whitespace && words > most as usize {
-        problems.push(format!(
-            "maximum {most} argument(s) allowed, {words} supplied"
-        ));
-    }
-}
-
 /// Whether a math event is inline or display.
 enum MathKind {
     Inline,
@@ -909,6 +808,77 @@ mod tests {
         ] {
             same(input);
         }
+    }
+
+    #[test]
+    fn same_directives_and_roles() {
+        for input in [
+            "```{versionadded} 1.2 beta\n:class: x\n:hidden:\n\n*New* here.\n```\n\n\
+             ```{centered} Hello *world*\n```\n\n\
+             ```{code-block} rust\nfn main() {}\n```\n\n\
+             Press {kbd}`Ctrl+C` or `code`.\n",
+            "```{versionadded} 2\n---\nclass: big\nhidden: true\n---\nText.\n```\n",
+            "```{versionadded}\n:nope: 1\n:hidden: yes\n```\n",
+            "```{mermaid} arg\n:theme: dark\n\ngraph TD; A-->B\n```\n\n{kbd}`x`\n",
+            "> ```{versionadded} 1\n> Inside **quote**.\n> ```\n",
+            "```{versionadded} 1\n---\n[bad\n---\nx\n```\n",
+            "{kbd}` a  b `\n",
+        ] {
+            same_with(input, &syntax());
+        }
+    }
+
+    /// The directives of `input`'s first top-level node, as JSON.
+    fn mdit_json(input: &str) -> (Vec<Node>, serde_json::Value) {
+        let (doc, diagnostics) = parse_mdit("t.md", input, &syntax());
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let value = serde_json::to_value(&doc.children).unwrap();
+        (doc.children, value)
+    }
+
+    #[test]
+    fn colon_fence_is_a_directive() {
+        let (nodes, value) =
+            mdit_json(":::{versionadded} 1.2 beta\n:class: x\n\n*New* here.\n:::\n");
+        assert_eq!(value[0]["kind"], "versionadded");
+        assert_eq!(
+            value[0]["attrs"],
+            json!({"argument": "1.2 beta", "options": {"class": "x"}})
+        );
+        assert_eq!(plain(nodes[0].children()), "New here.");
+    }
+
+    #[test]
+    fn colon_fences_nest() {
+        let (nodes, value) =
+            mdit_json("::::{versionadded} 1\n:::{versionadded} 2\ninner\n:::\nouter\n::::\n");
+        assert_eq!(nodes.len(), 1);
+        let outer = nodes[0].children();
+        assert_eq!(value[0]["children"][0]["attrs"]["argument"], "2");
+        assert_eq!(plain(outer[0].children()), "inner");
+        assert_eq!(plain(&outer[1..]), "outer");
+    }
+
+    #[test]
+    fn unterminated_colon_fence_runs_to_end() {
+        let (nodes, _) = mdit_json(":::{versionadded} 1\ntext\n\nmore\n");
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].children().len(), 2);
+        let (nodes, _) = mdit_json("> :::{versionadded} 1\n> x\n\nafter\n");
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(plain(&nodes[1..]), "after");
+    }
+
+    #[test]
+    fn directive_content_sees_page_references() {
+        let (nodes, _) =
+            mdit_json("```{versionadded} 1\n[x][r] and note[^n]\n```\n\n[r]: /u\n\n[^n]: N.\n");
+        let inline = nodes[0].children()[0].children();
+        let Node::Link(link) = &inline[0] else {
+            panic!("{inline:?}")
+        };
+        assert_eq!(link.url, "/u");
+        assert!(inline.iter().any(|n| n.kind() == "footnote_reference"));
     }
 
     fn parse_ok(input: &str) -> Document {
