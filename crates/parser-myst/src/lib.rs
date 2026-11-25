@@ -32,6 +32,7 @@
 
 mod convert;
 mod md;
+mod plugins;
 
 use std::collections::BTreeMap;
 use std::ops::Range;
@@ -879,6 +880,19 @@ mod tests {
             "| a | b |\n|:--|--:|\n| 1 | 2 |\n",
             "[docs](guide.md \"Guide\") ![alt *text*](a.png)  \nnext <b>x</b>\n\n<div>\nblock\n</div>\n",
             "one\ntwo\n",
+        ] {
+            same(input);
+        }
+    }
+
+    #[test]
+    fn same_footnotes_and_math() {
+        for input in [
+            "See[^n] $a+b$ and\n$$x^2$$\n\n[^n]: The note.\n",
+            "x[^a]\n\n[^a]: First.\n\n    Second.\n",
+            "Undefined[^none] here.\n",
+            "$$\nx^2\n$$\n",
+            "Price $5 and $ x $ no.\n",
         ] {
             same(input);
         }

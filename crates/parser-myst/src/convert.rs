@@ -32,6 +32,9 @@ use markdown_it::plugins::extra::tasklist::TaskListMarker;
 use markdown_it::plugins::html::html_block::HtmlBlock;
 use markdown_it::plugins::html::html_inline::HtmlInline;
 
+use crate::plugins::footnote::{FootnoteDefinition, FootnoteReference};
+use crate::plugins::math::Math;
+
 /// The document `root` (parsed from `input`) is, plus any problems found.
 pub(crate) fn document(source: &str, input: &str, root: &MdNode) -> (Document, Vec<Diagnostic>) {
     let mut converter = Converter {
@@ -217,6 +220,23 @@ impl Converter<'_> {
                 span: self.span(node),
                 format: "html".into(),
                 value: html.content.clone(),
+            })
+        } else if let Some(r) = node.cast::<FootnoteReference>() {
+            Node::FootnoteReference(lsdocs_plugin_sdk::doctree::FootnoteReference {
+                span: self.span(node),
+                label: r.label.clone(),
+            })
+        } else if let Some(d) = node.cast::<FootnoteDefinition>() {
+            Node::FootnoteDefinition(lsdocs_plugin_sdk::doctree::FootnoteDefinition {
+                span: self.block_span(node),
+                label: d.label.clone(),
+                children: self.nodes(&node.children),
+            })
+        } else if let Some(m) = node.cast::<Math>() {
+            Node::Math(lsdocs_plugin_sdk::doctree::Math {
+                span: self.span(node),
+                display: m.display,
+                value: m.value.clone(),
             })
         } else if let Some(table) = node.cast::<MdTable>() {
             self.table(node, table)
