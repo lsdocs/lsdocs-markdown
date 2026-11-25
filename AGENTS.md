@@ -54,7 +54,7 @@ shows them. `nur ci` runs what CI runs: run it before committing. Tools:
 | Path | What |
 |---|---|
 | `crates/parser-markdown` | `lsdocs-parser-markdown`: the Markdown parser plugins, one per dialect, each behind a feature (all on by default; at least one required). `pulldown-cmark` (`src/pulldown_cmark.rs`, plugin `parser-pulldown-cmark`) is here; `myst` re-exports `lsdocs-parser-myst`. |
-| `crates/parser-myst` | `lsdocs-parser-myst`: the MyST dialect (plugin `parser-myst`). |
+| `crates/parser-myst` | `lsdocs-parser-myst`: the MyST dialect (plugin `parser-myst`) on `markdown-it-rs`: `md.rs` sets up the parser, `plugins/` holds the MyST rules (each with node types of its own), `convert.rs` turns markdown-it's tree into the document shape. |
 
 A crate that cannot build without default features lists the features
 `nur msrv` checks it with in `[package.metadata.lsdocs] msrv-features`.

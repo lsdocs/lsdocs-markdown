@@ -1,9 +1,9 @@
 //! The MyST Markdown parser plugin, `parser-myst`.
 //!
-//! Parses CommonMark (via `pulldown-cmark`), with MyST's directives and
-//! roles, into a document tree in the
-//! shared shape (see "Document shape" in `spec/wire.md`). Every node carries
-//! the byte span it came from.
+//! Parses Markdown with markdown-it (the `markdown-it-rs` crate), the
+//! parser MyST is built on, with MyST's syntax as markdown-it rules, into
+//! a document tree in the shared shape (see "Document shape" in
+//! `spec/wire.md`). Every node carries the byte span it came from.
 //!
 //! - Top-level headings open sections: everything up to the next heading of
 //!   the same or a higher level is nested in a `section` whose first child
@@ -11,43 +11,36 @@
 //! - Extensions: GitHub tables, task lists and alerts (`> [!NOTE]` becomes
 //!   an `admonition`), footnotes (`[^1]`), definition lists, and math
 //!   (`$x$` inline, `$$x$$` display).
-//!
 //! - Front matter: YAML between `---` fences, or TOML between `+++` fences,
 //!   at the very start of the file. It must be a mapping; it becomes the
 //!   document's metadata.
-//! - An explicit `{#id}` on a heading becomes its section's `id`; the host
-//!   generates the others after parsing.
+//! - An explicit `{#id}` on a heading becomes its section's `id`, as does
+//!   a `(label)=` target before it; a target elsewhere is an `anchor`. The
+//!   host generates the other ids after parsing.
 //! - Raw HTML becomes `raw` nodes with format `html`.
 //! - Soft line breaks become `\n` within text; hard breaks become
 //!   `line_break` nodes.
-//! - Directives and roles, in MyST's syntax: a fence whose language is
-//!   `{name}` is a directive (the rest of the info line is its argument,
-//!   leading `:option: value` lines or a `---` YAML block its options,
-//!   the rest its content), and `` {name}`text` `` is a role. Those
-//!   plugins declare (see "Syntax extensions" in `spec/wire.md`) are read
-//!   by their declaration: options are checked and markup content is
-//!   parsed. Other directives become custom nodes of their name with the
-//!   content as text, as unknown reStructuredText directives do; other
-//!   roles stay text and code.
+//! - Directives and roles, in MyST's syntax: a backtick, tilde or colon
+//!   (`:::`) fence whose info string starts with `{name}` is a directive
+//!   (the rest of the info line is its argument, leading `:option: value`
+//!   lines or a `---` YAML block its options, the rest its content), and
+//!   `` {name}`text` `` is a role. Those plugins declare (see "Syntax
+//!   extensions" in `spec/wire.md`) are read by their declaration: options
+//!   are checked and markup content is parsed in place, with the page's
+//!   link references and footnotes. Other directives become custom nodes
+//!   of their name with the content as text, as unknown reStructuredText
+//!   directives do; other roles stay text and code.
 
-use std::collections::BTreeMap;
-use std::ops::Range;
+mod convert;
+mod lines;
+mod md;
+mod plugins;
 
-use lsdocs_plugin_sdk::doctree::{
-    Admonition, Align, BlockQuote, CodeBlock, Custom, DefinitionDescription, DefinitionList,
-    DefinitionTerm, Document, Emphasis, FootnoteDefinition, FootnoteReference, Heading, Image,
-    InlineCode, LineBreak, Link, List, ListItem, Math, Metadata, Node, Paragraph, Raw, Section,
-    Span, Strong, Table, TableCell, TableRow, Text, ThematicBreak, Value,
-};
-use lsdocs_plugin_sdk::protocol::{
-    ArgumentSyntax, ContentSyntax, Diagnostic, DirectiveSyntax, OptionSyntax, ParseParams,
-    ParseResult, Severity, Syntax,
-};
+use lsdocs_plugin_sdk::doctree::Document;
+use std::panic::{AssertUnwindSafe, catch_unwind};
+
+use lsdocs_plugin_sdk::protocol::{Diagnostic, ParseParams, ParseResult, Severity, Syntax};
 use lsdocs_plugin_sdk::{Context, Parser, Plugin, PluginResult};
-use pulldown_cmark::{
-    Alignment, BlockQuoteKind, CodeBlockKind, Event, MetadataBlockKind, Options, Parser as Cmark,
-    Tag, TagEnd,
-};
 
 /// The plugin, as registered with the host.
 pub fn plugin() -> Plugin {
@@ -76,18 +69,6 @@ impl Parser for Myst {
     }
 }
 
-fn options() -> Options {
-    Options::ENABLE_TABLES
-        | Options::ENABLE_TASKLISTS
-        | Options::ENABLE_GFM
-        | Options::ENABLE_FOOTNOTES
-        | Options::ENABLE_DEFINITION_LIST
-        | Options::ENABLE_MATH
-        | Options::ENABLE_HEADING_ATTRIBUTES
-        | Options::ENABLE_YAML_STYLE_METADATA_BLOCKS
-        | Options::ENABLE_PLUSES_DELIMITED_METADATA_BLOCKS
-}
-
 /// Parses Markdown into a document, plus any problems found (e.g. invalid
 /// front matter).
 pub fn parse(source: &str, input: &str) -> (Document, Vec<Diagnostic>) {
@@ -101,796 +82,256 @@ pub fn parse_with_syntax(
     input: &str,
     syntax: &Syntax,
 ) -> (Document, Vec<Diagnostic>) {
-    parse_part(source, input, syntax, options())
-}
-
-/// Parses `input`, the whole file or a piece of it, with `options`.
-fn parse_part(
-    source: &str,
-    input: &str,
-    syntax: &Syntax,
-    options: Options,
-) -> (Document, Vec<Diagnostic>) {
-    let mut builder = Builder::new(source, input, syntax);
-    for (event, range) in Cmark::new_ext(input, options).into_offset_iter() {
-        builder.event(event, range);
-    }
-    builder.finish()
-}
-
-/// Parses a piece of the file (a directive's content or argument) found
-/// at `map`'s offsets: no front matter, and spans moved to where the
-/// piece is in the file.
-fn parse_piece(
-    source: &str,
-    piece: &str,
-    syntax: &Syntax,
-    map: &impl Fn(u32) -> u32,
-) -> (Vec<Node>, Vec<Diagnostic>) {
-    let options = options()
-        - Options::ENABLE_YAML_STYLE_METADATA_BLOCKS
-        - Options::ENABLE_PLUSES_DELIMITED_METADATA_BLOCKS;
-    let (mut doc, mut diagnostics) = parse_part(source, piece, syntax, options);
-    move_spans(&mut doc.children, map);
-    for d in &mut diagnostics {
-        if let Some(s) = &mut d.span {
-            *s = Span::new(map(s.start), map(s.end));
-        }
-    }
-    (doc.children, diagnostics)
-}
-
-/// Moves the spans of `nodes` and their descendants by `map`.
-fn move_spans(nodes: &mut [Node], map: &impl Fn(u32) -> u32) {
-    for node in nodes {
-        if let Some(s) = node.span_mut() {
-            *s = Span::new(map(s.start), map(s.end));
-        }
-        if let Some(children) = node.children_mut() {
-            move_spans(children, map);
-        }
-    }
-}
-
-/// What an open element is collecting.
-enum Frame {
-    /// A node whose children are collected into it.
-    Node(Node),
-    /// A code block; text is its value. Each piece of text's offset in
-    /// the value and in the source are noted, to find directive content
-    /// in the source.
-    Code(CodeBlock, Vec<(usize, usize)>),
-    /// An image; text inside is its alt text.
-    Image(Image),
-    /// Raw HTML; text is its value.
-    Html(Raw),
-    /// Front matter; text is its source.
-    Metadata(MetadataBlockKind, Span, String),
-    /// A table head: cells collected into a header row.
-    TableHead(TableRow),
-}
-
-struct Builder<'a> {
-    document: Document,
-    /// The text being parsed.
-    input: &'a str,
-    /// Declared directives and roles.
-    syntax: &'a Syntax,
-    stack: Vec<Frame>,
-    diagnostics: Vec<Diagnostic>,
-    /// Column alignments of the table being built.
-    aligns: Vec<Align>,
-}
-
-fn span(range: &Range<usize>) -> Option<Span> {
-    let clamp = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
-    Some(Span::new(clamp(range.start), clamp(range.end)))
-}
-
-impl<'a> Builder<'a> {
-    fn new(source: &str, input: &'a str, syntax: &'a Syntax) -> Self {
-        Self {
-            document: Document::new(source),
-            input,
-            syntax,
-            stack: Vec::new(),
-            diagnostics: Vec::new(),
-            aligns: Vec::new(),
-        }
-    }
-
-    /// Adds a finished node to the innermost open element.
-    fn push(&mut self, node: Node) {
-        let children = match self.stack.last_mut() {
-            None => &mut self.document.children,
-            Some(Frame::Node(parent)) => match parent.children_mut() {
-                Some(children) => children,
-                None => return,
-            },
-            Some(Frame::TableHead(row)) => &mut row.children,
-            // Leaf frames take text, not nodes; anything else is dropped.
-            Some(_) => return,
-        };
-        // Merge adjacent text so soft breaks don't fragment paragraphs.
-        if let (Node::Text(new), Some(Node::Text(prev))) = (&node, children.last_mut()) {
-            prev.value.push_str(&new.value);
-            if let (Some(a), Some(b)) = (prev.span, new.span) {
-                prev.span = Some(Span::new(a.start.min(b.start), a.end.max(b.end)));
-            }
-            return;
-        }
-        children.push(node);
-    }
-
-    /// The alt text of the innermost open image, if inside one. Everything
-    /// inside an image (even nested emphasis) only contributes alt text.
-    fn image_alt(&mut self) -> Option<&mut String> {
-        self.stack.iter_mut().rev().find_map(|frame| match frame {
-            Frame::Image(image) => Some(&mut image.alt),
-            _ => None,
-        })
-    }
-
-    fn text(&mut self, value: &str, range: &Range<usize>) {
-        if let Some(alt) = self.image_alt() {
-            alt.push_str(value);
-            return;
-        }
-        match self.stack.last_mut() {
-            Some(Frame::Code(code, pieces)) => {
-                pieces.push((code.value.len(), range.start));
-                code.value.push_str(value);
-            }
-            Some(Frame::Html(raw)) => raw.value.push_str(value),
-            Some(Frame::Metadata(_, _, buf)) => buf.push_str(value),
-            _ => self.push(Node::Text(Text {
-                span: span(range),
-                value: value.to_owned(),
-            })),
-        }
-    }
-
-    fn event(&mut self, event: Event<'_>, range: Range<usize>) {
-        let event_kind = match event {
-            Event::DisplayMath(_) => MathKind::Display,
-            _ => MathKind::Inline,
-        };
-        match event {
-            Event::Start(tag) => self.start(tag, &range),
-            Event::End(tag) => self.end(tag),
-            Event::Text(t) => self.text(&t, &range),
-            Event::Code(code) => match self.image_alt() {
-                Some(alt) => alt.push_str(&code),
-                None => match self.role_name(range.start) {
-                    Some((name, start)) => {
-                        let span = span(&(start..range.end));
-                        let value = code.into_string();
-                        self.push(Node::Custom(Custom {
-                            span,
-                            kind: "role".into(),
-                            attrs: BTreeMap::from([
-                                ("name".into(), Value::String(name)),
-                                ("text".into(), Value::String(value.clone())),
-                            ]),
-                            children: vec![Node::Text(Text { span, value })],
-                        }));
-                    }
-                    None => self.push(Node::InlineCode(InlineCode {
-                        span: span(&range),
-                        value: code.into_string(),
-                    })),
-                },
-            },
-            Event::Html(html) | Event::InlineHtml(html) => match self.stack.last_mut() {
-                Some(Frame::Html(raw)) => raw.value.push_str(&html),
-                _ => self.push(Node::Raw(Raw {
-                    span: span(&range),
-                    format: "html".into(),
-                    value: html.into_string(),
-                })),
-            },
-            Event::SoftBreak => self.text("\n", &range),
-            Event::HardBreak => self.push(Node::LineBreak(LineBreak { span: span(&range) })),
-            Event::Rule => self.push(Node::ThematicBreak(ThematicBreak { span: span(&range) })),
-            Event::TaskListMarker(checked) => {
-                if let Some(Frame::Node(Node::ListItem(item))) = self.stack.last_mut() {
-                    item.checked = Some(checked);
-                }
-            }
-            Event::InlineMath(value) | Event::DisplayMath(value) => self.push(Node::Math(Math {
-                span: span(&range),
-                display: matches!(event_kind, MathKind::Display),
-                value: value.into_string(),
-            })),
-            Event::FootnoteReference(label) => {
-                self.push(Node::FootnoteReference(FootnoteReference {
-                    span: span(&range),
-                    label: label.into_string(),
-                }))
-            }
-        }
-    }
-
-    fn start(&mut self, tag: Tag<'_>, range: &Range<usize>) {
-        let span = span(range);
-        let frame = match tag {
-            Tag::Paragraph => Frame::Node(Node::Paragraph(Paragraph {
-                span,
-                children: vec![],
-            })),
-            Tag::Heading { level, id, .. } => Frame::Node(Node::Heading(Heading {
-                span,
-                level: level as u8,
-                id: id.map(|id| id.into_string()),
-                children: vec![],
-            })),
-            Tag::BlockQuote(None) => Frame::Node(Node::BlockQuote(BlockQuote {
-                span,
-                children: vec![],
-            })),
-            // A GitHub alert: `> [!NOTE]`.
-            Tag::BlockQuote(Some(kind)) => Frame::Node(Node::Admonition(Admonition {
-                span,
-                kind: match kind {
-                    BlockQuoteKind::Note => "note",
-                    BlockQuoteKind::Tip => "tip",
-                    BlockQuoteKind::Important => "important",
-                    BlockQuoteKind::Warning => "warning",
-                    BlockQuoteKind::Caution => "caution",
-                }
-                .into(),
-                title: None,
-                children: vec![],
-            })),
-            Tag::FootnoteDefinition(label) => {
-                Frame::Node(Node::FootnoteDefinition(FootnoteDefinition {
-                    span,
-                    label: label.into_string(),
-                    children: vec![],
-                }))
-            }
-            Tag::DefinitionList => Frame::Node(Node::DefinitionList(DefinitionList {
-                span,
-                children: vec![],
-            })),
-            Tag::DefinitionListTitle => Frame::Node(Node::DefinitionTerm(DefinitionTerm {
-                span,
-                children: vec![],
-            })),
-            Tag::DefinitionListDefinition => {
-                Frame::Node(Node::DefinitionDescription(DefinitionDescription {
-                    span,
-                    children: vec![],
-                }))
-            }
-            Tag::CodeBlock(kind) => {
-                let (language, info) = match kind {
-                    CodeBlockKind::Fenced(info) => {
-                        let info = info.trim();
-                        match info.split_once(char::is_whitespace) {
-                            Some((lang, rest)) => {
-                                (Some(lang.to_owned()), Some(rest.trim().to_owned()))
-                            }
-                            None if info.is_empty() => (None, None),
-                            None => (Some(info.to_owned()), None),
-                        }
-                    }
-                    CodeBlockKind::Indented => (None, None),
-                };
-                Frame::Code(
-                    CodeBlock {
-                        span,
-                        language,
-                        info,
-                        value: String::new(),
-                    },
-                    Vec::new(),
-                )
-            }
-            Tag::HtmlBlock => Frame::Html(Raw {
-                span,
-                format: "html".into(),
-                value: String::new(),
-            }),
-            Tag::List(start) => Frame::Node(Node::List(List {
-                span,
-                ordered: start.is_some(),
-                start: start.filter(|&n| n != 1),
-                children: vec![],
-            })),
-            Tag::Item => Frame::Node(Node::ListItem(ListItem {
-                span,
-                checked: None,
-                children: vec![],
-            })),
-            Tag::Table(aligns) => {
-                self.aligns = aligns
-                    .iter()
-                    .map(|a| match a {
-                        Alignment::None => Align::None,
-                        Alignment::Left => Align::Left,
-                        Alignment::Center => Align::Center,
-                        Alignment::Right => Align::Right,
-                    })
-                    .collect();
-                Frame::Node(Node::Table(Table {
-                    span,
-                    align: self.aligns.clone(),
-                    children: vec![],
-                }))
-            }
-            Tag::TableHead => Frame::TableHead(TableRow {
-                span,
-                header: true,
-                children: vec![],
-            }),
-            Tag::TableRow => Frame::Node(Node::TableRow(TableRow {
-                span,
-                header: false,
-                children: vec![],
-            })),
-            Tag::TableCell => Frame::Node(Node::TableCell(TableCell {
-                span,
-                children: vec![],
-            })),
-            Tag::Emphasis => Frame::Node(Node::Emphasis(Emphasis {
-                span,
-                children: vec![],
-            })),
-            Tag::Strong => Frame::Node(Node::Strong(Strong {
-                span,
-                children: vec![],
-            })),
-            Tag::Link {
-                dest_url, title, ..
-            } => Frame::Node(Node::Link(Link {
-                span,
-                url: dest_url.into_string(),
-                title: Some(title.into_string()).filter(|t| !t.is_empty()),
-                target: None,
-                children: vec![],
-            })),
-            Tag::Image {
-                dest_url, title, ..
-            } => Frame::Image(Image {
-                span,
-                url: dest_url.into_string(),
-                alt: String::new(),
-                title: Some(title.into_string()).filter(|t| !t.is_empty()),
-            }),
-            Tag::MetadataBlock(kind) => {
-                Frame::Metadata(kind, span.unwrap_or(Span::new(0, 0)), String::new())
-            }
-            // Not enabled; keep their content by wrapping it in a paragraph-
-            // like container that is flattened on close.
-            Tag::Strikethrough | Tag::Superscript | Tag::Subscript => {
-                Frame::Node(Node::Paragraph(Paragraph {
-                    span,
-                    children: vec![],
-                }))
-            }
-        };
-        self.stack.push(frame);
-    }
-
-    fn end(&mut self, tag: TagEnd) {
-        let Some(frame) = self.stack.pop() else {
-            return;
-        };
-        match frame {
-            Frame::Node(node) => {
-                // Inline containers from unsupported extensions are
-                // flattened into their parent.
-                let flatten = matches!(
-                    tag,
-                    TagEnd::Strikethrough | TagEnd::Superscript | TagEnd::Subscript
-                );
-                if flatten {
-                    if let Node::Paragraph(p) = node {
-                        for child in p.children {
-                            self.push(child);
-                        }
-                    }
-                } else {
-                    self.push(node);
-                }
-            }
-            Frame::Code(code, pieces) => {
-                let node = self.code_or_directive(code, &pieces);
-                self.push(node);
-            }
-            Frame::Image(image) => self.push(Node::Image(image)),
-            Frame::Html(raw) => self.push(Node::Raw(raw)),
-            Frame::TableHead(row) => self.push(Node::TableRow(row)),
-            Frame::Metadata(kind, span, text) => self.front_matter(kind, span, &text),
-        }
-    }
-
-    fn front_matter(&mut self, kind: MetadataBlockKind, span: Span, text: &str) {
-        let parsed: Result<Value, String> = match kind {
-            MetadataBlockKind::YamlStyle => serde_saphyr::from_str(text).map_err(|e| e.to_string()),
-            MetadataBlockKind::PlusesStyle => toml::from_str(text).map_err(|e| e.to_string()),
-        };
-        let format = match kind {
-            MetadataBlockKind::YamlStyle => "YAML",
-            MetadataBlockKind::PlusesStyle => "TOML",
-        };
-        match parsed {
-            Ok(Value::Object(map)) => {
-                self.document.metadata = map.into_iter().collect::<Metadata>()
-            }
-            Ok(Value::Null) => {}
-            Ok(_) => self.warn(
-                span,
-                format!("{format} front matter must be a mapping of keys to values"),
-            ),
-            Err(e) => self.warn(span, format!("invalid {format} front matter: {e}")),
-        }
-    }
-
-    fn warn(&mut self, span: Span, message: String) {
-        self.warn_with(Some(span), message, "front-matter");
-    }
-
-    fn warn_with(&mut self, span: Option<Span>, message: String, code: &str) {
-        self.diagnostics.push(Diagnostic {
-            severity: Severity::Warning,
-            message,
-            source: Some(self.document.source.clone()),
-            span,
-            code: Some(code.into()),
-        });
-    }
-
-    /// If the inline code starting at `start` follows a declared role's
-    /// `{name}`, removes that from the text before it and returns the
-    /// role's name and where its `{` is.
-    fn role_name(&mut self, start: usize) -> Option<(String, usize)> {
-        let syntax = self.syntax;
-        let children = match self.stack.last_mut() {
-            Some(Frame::Node(parent)) => parent.children_mut()?,
-            Some(Frame::TableHead(row)) => &mut row.children,
-            _ => return None,
-        };
-        let Some(Node::Text(text)) = children.last_mut() else {
-            return None;
-        };
-        let end = text.span?.end as usize;
-        if end != start {
-            return None;
-        }
-        let rest = text.value.strip_suffix('}')?;
-        let open = rest.rfind('{')?;
-        let name = &rest[open + 1..];
-        if !is_name(name) || !syntax.has_role(&name.to_lowercase()) {
-            return None;
-        }
-        let name = name.to_lowercase();
-        let len = text.value.len() - open;
-        let brace = start - len;
-        text.value.truncate(open);
-        if let Some(s) = &mut text.span {
-            s.end = u32::try_from(brace).unwrap_or(s.end);
-        }
-        if text.value.is_empty() {
-            children.pop();
-        }
-        Some((name, brace))
-    }
-
-    /// A fenced code block, or a directive if its language is `{name}`.
-    fn code_or_directive(&mut self, code: CodeBlock, pieces: &[(usize, usize)]) -> Node {
-        let Some(name) = code
-            .language
-            .as_deref()
-            .and_then(|l| l.strip_prefix('{')?.strip_suffix('}'))
-            .filter(|n| is_name(n))
-            .map(str::to_lowercase)
-        else {
-            return Node::CodeBlock(code);
-        };
-        let at = code.span.map(|s| s.start);
-        // Where the value's offsets are in the source.
-        let source_offset = |offset: usize| -> u32 {
-            let found = pieces.iter().rev().find(|(value, _)| *value <= offset);
-            let n = match found {
-                Some((value, source)) => source + (offset - value),
-                None => at.map_or(0, |a| a as usize),
-            };
-            u32::try_from(n).unwrap_or(u32::MAX)
-        };
-        let argument = code.info.clone().unwrap_or_default();
-        let (options, body_start, options_error) = directive_options(&code.value);
-        let body = code.value[body_start..].trim_end_matches('\n');
-        let syntax = self.syntax;
-        let mut attrs = BTreeMap::new();
-        if !argument.is_empty() {
-            attrs.insert("argument".to_owned(), Value::String(argument.clone()));
-        }
-        let mut children = Vec::new();
-        let span = code.span;
-        if let Some(error) = options_error {
-            self.warn_with(span, format!("directive \"{name}\": {error}"), "directive");
-        }
-        let Some(declared) = syntax.directive(&name) else {
-            // Not declared: kept as text, as reStructuredText keeps
-            // unknown directives.
-            let options: serde_json::Map<String, Value> = options
-                .into_iter()
-                .map(|(k, v)| (k, Value::String(v.unwrap_or_default())))
-                .collect();
-            if !options.is_empty() {
-                attrs.insert("options".to_owned(), Value::Object(options));
-            }
-            if !body.is_empty() {
-                attrs.insert("content".to_owned(), Value::String(body.to_owned()));
-            }
-            return Node::Custom(Custom {
-                span,
-                kind: name,
-                attrs,
-                children,
-            });
-        };
-        let mut problems = Vec::new();
-        check_arguments(declared, &argument, &mut problems);
-        let mut values = serde_json::Map::new();
-        for (key, value) in options {
-            match (declared.options.get(&key), value) {
-                (None, _) => problems.push(format!("unknown option: \"{key}\"")),
-                (Some(OptionSyntax::Flag), Some(v)) if !v.is_empty() => {
-                    problems.push(format!("option \"{key}\" takes no value"))
-                }
-                (Some(OptionSyntax::Flag), _) => {
-                    values.insert(key, Value::Bool(true));
-                }
-                (Some(OptionSyntax::Required), None) => {
-                    problems.push(format!("option \"{key}\" needs a value"))
-                }
-                (Some(OptionSyntax::Required), Some(v)) if v.is_empty() => {
-                    problems.push(format!("option \"{key}\" needs a value"))
-                }
-                (Some(_), v) => {
-                    values.insert(key, Value::String(v.unwrap_or_default()));
-                }
-            }
-        }
-        if !values.is_empty() {
-            attrs.insert("options".to_owned(), Value::Object(values));
-        }
-        match declared.content {
-            ContentSyntax::None if !body.trim().is_empty() => {
-                problems.push("no content permitted".to_owned());
-            }
-            ContentSyntax::None => {}
-            ContentSyntax::Text => {
-                if !body.is_empty() {
-                    attrs.insert("content".to_owned(), Value::String(body.to_owned()));
-                }
-            }
-            ContentSyntax::Blocks => {
-                let map = |o: u32| source_offset(body_start + o as usize);
-                let (nodes, diagnostics) = parse_piece(&self.document.source, body, syntax, &map);
-                children = nodes;
-                self.diagnostics.extend(diagnostics);
-            }
-        }
-        if declared.argument == ArgumentSyntax::Inline && !argument.is_empty() {
-            // The argument is on the fence line, after `{name}`.
-            let line_start = span.map_or(0, |s| s.start as usize);
-            let line = self.input[line_start.min(self.input.len())..]
-                .lines()
-                .next()
-                .unwrap_or_default();
-            let offset = line.find(argument.as_str()).map_or(0, |i| line_start + i);
-            let map = |o: u32| u32::try_from(offset).unwrap_or(0).saturating_add(o);
-            let (nodes, diagnostics) = parse_piece(&self.document.source, &argument, syntax, &map);
-            self.diagnostics.extend(diagnostics);
-            let inlines = match nodes.into_iter().next() {
-                Some(Node::Paragraph(p)) => p.children,
-                _ => Vec::new(),
-            };
-            let end = offset + argument.len();
-            children.insert(
-                0,
-                Node::Custom(Custom {
-                    span: Some(Span::new(map(0), u32::try_from(end).unwrap_or(0))),
-                    kind: "directive_argument".into(),
-                    attrs: BTreeMap::new(),
-                    children: inlines,
-                }),
-            );
-        }
-        for problem in problems {
-            self.warn_with(
-                span,
-                format!("directive \"{name}\": {problem}"),
-                "directive",
-            );
-        }
-        Node::Custom(Custom {
-            span,
-            kind: name,
-            attrs,
-            children,
-        })
-    }
-
-    fn finish(mut self) -> (Document, Vec<Diagnostic>) {
-        // Close anything left open by malformed input.
-        while !self.stack.is_empty() {
-            self.end(TagEnd::Paragraph);
-        }
-        let children = std::mem::take(&mut self.document.children);
-        self.document.children = sectionize(children);
-        (self.document, self.diagnostics)
-    }
-}
-
-/// Whether `name` can be a directive or role name: letters, digits and
-/// `-`, `_`, `:`, `.`, `+`, starting with a letter or digit.
-fn is_name(name: &str) -> bool {
-    name.chars().next().is_some_and(char::is_alphanumeric)
-        && name
-            .chars()
-            .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | ':' | '.' | '+'))
-}
-
-/// Directive options as written: names and values (`None` for none).
-type OptionList = Vec<(String, Option<String>)>;
-
-/// A directive's options at the start of its fence's text: `:name: value`
-/// lines, or a YAML mapping between `---` lines. Returns them (`None` for
-/// no value), where the content starts (after one blank line), and a
-/// problem with them, if any.
-fn directive_options(text: &str) -> (OptionList, usize, Option<String>) {
-    let mut options = Vec::new();
-    let mut pos = 0;
-    let mut lines = text.split_inclusive('\n').peekable();
-    let mut error = None;
-    if lines.peek().is_some_and(|l| l.trim_end() == "---") {
-        let first = lines.next().unwrap_or_default();
-        let mut yaml = String::new();
-        let mut end = None;
-        let mut at = first.len();
-        for line in lines.by_ref() {
-            at += line.len();
-            if line.trim_end() == "---" {
-                end = Some(at);
-                break;
-            }
-            yaml.push_str(line);
-        }
-        match end {
-            Some(end) => {
-                pos = end;
-                match serde_saphyr::from_str::<Value>(&yaml) {
-                    Ok(Value::Object(map)) => {
-                        for (key, value) in map {
-                            let value = match value {
-                                Value::Null | Value::Bool(true) => None,
-                                Value::String(s) => Some(s),
-                                other => Some(other.to_string()),
-                            };
-                            options.push((key, value));
-                        }
-                    }
-                    Ok(Value::Null) => {}
-                    Ok(_) => error = Some("options must be a mapping".to_owned()),
-                    Err(e) => error = Some(format!("invalid options: {e}")),
-                }
-            }
-            None => return (options, 0, None),
-        }
-    } else {
-        for line in lines.by_ref() {
-            let Some(rest) = line.trim_end().strip_prefix(':') else {
-                break;
-            };
-            let Some((key, value)) = rest.split_once(':') else {
-                break;
-            };
-            if key.is_empty() || key.contains(char::is_whitespace) {
-                break;
-            }
-            let value = value.trim();
-            options.push((
-                key.to_owned(),
-                (!value.is_empty()).then(|| value.to_owned()),
-            ));
-            pos += line.len();
-        }
-    }
-    // One blank line may separate options from content.
-    if !options.is_empty()
-        && let Some(line) = text[pos..].split_inclusive('\n').next()
-        && line.trim().is_empty()
-    {
-        pos += line.len();
-    }
-    (options, pos, error)
-}
-
-/// Problems with a directive's argument against its declaration.
-fn check_arguments(declared: &DirectiveSyntax, argument: &str, problems: &mut Vec<String>) {
-    let most = declared.required_arguments + declared.optional_arguments;
-    let words = argument.split_whitespace().count();
-    if words < declared.required_arguments as usize {
-        problems.push(format!(
-            "{} argument(s) required, {words} supplied",
-            declared.required_arguments
-        ));
-    } else if most == 0 && words > 0 {
-        problems.push("no arguments permitted".to_owned());
-    } else if !declared.final_argument_whitespace && words > most as usize {
-        problems.push(format!(
-            "maximum {most} argument(s) allowed, {words} supplied"
-        ));
-    }
-}
-
-/// Whether a math event is inline or display.
-enum MathKind {
-    Inline,
-    Display,
-}
-
-/// Nests top-level nodes into sections: each heading opens a section that
-/// holds everything up to the next heading of the same or a higher level
-/// (a lower or equal level number). The heading's id moves to the section.
-fn sectionize(nodes: Vec<Node>) -> Vec<Node> {
-    fn add(section: &mut Section, node: Node) {
-        if let (Some(span), Some(end)) = (&mut section.span, node.span()) {
-            span.end = span.end.max(end.end);
-        }
-        section.children.push(node);
-    }
-    fn close(open: &mut Vec<(u8, Section)>, out: &mut Vec<Node>) {
-        if let Some((_, section)) = open.pop() {
-            let node = Node::Section(section);
-            match open.last_mut() {
-                Some((_, parent)) => add(parent, node),
-                None => out.push(node),
-            }
-        }
-    }
-    let mut out = Vec::new();
-    let mut open: Vec<(u8, Section)> = Vec::new();
-    for node in nodes {
-        match node {
-            Node::Heading(mut heading) => {
-                while open
-                    .last()
-                    .is_some_and(|(level, _)| *level >= heading.level)
-                {
-                    close(&mut open, &mut out);
-                }
-                let level = heading.level;
-                let mut section = Section {
-                    span: heading.span,
-                    id: heading.id.take(),
-                    children: vec![],
-                };
-                add(&mut section, Node::Heading(heading));
-                open.push((level, section));
-            }
-            node => match open.last_mut() {
-                Some((_, section)) => add(section, node),
-                None => out.push(node),
-            },
-        }
-    }
-    while !open.is_empty() {
-        close(&mut open, &mut out);
-    }
-    out
+    let text = lines::normalize(input);
+    let md = md::parser(syntax);
+    // markdown-it-rs 0.7 can overflow on some input (its emphasis rule):
+    // in builds with overflow checks that panics; report it, don't crash.
+    let parsed = catch_unwind(AssertUnwindSafe(|| md.parse(&text.text)));
+    let (mut document, mut diagnostics) = match parsed {
+        Ok(root) => convert::document(source, &text.text, &root),
+        Err(_) => (
+            Document::new(source),
+            vec![Diagnostic {
+                severity: Severity::Error,
+                message: "the Markdown parser (markdown-it-rs) failed on this file".into(),
+                source: Some(source.to_owned()),
+                span: None,
+                code: Some("parser-failed".into()),
+            }],
+        ),
+    };
+    text.map(&mut document, &mut diagnostics);
+    (document, diagnostics)
 }
 
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::panic)]
     use super::*;
+    use lsdocs_plugin_sdk::doctree::{Align, Node, Span, Text};
     use serde_json::json;
+
+    /// The directives of `input`'s first top-level node, as JSON.
+    fn mdit_json(input: &str) -> (Vec<Node>, serde_json::Value) {
+        let (doc, diagnostics) = parse_with_syntax("t.md", input, &syntax());
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let value = serde_json::to_value(&doc.children).unwrap();
+        (doc.children, value)
+    }
+
+    #[test]
+    fn colon_fence_is_a_directive() {
+        let (nodes, value) =
+            mdit_json(":::{versionadded} 1.2 beta\n:class: x\n\n*New* here.\n:::\n");
+        assert_eq!(value[0]["kind"], "versionadded");
+        assert_eq!(
+            value[0]["attrs"],
+            json!({"argument": "1.2 beta", "options": {"class": "x"}})
+        );
+        assert_eq!(plain(nodes[0].children()), "New here.");
+    }
+
+    #[test]
+    fn colon_fences_nest() {
+        let (nodes, value) =
+            mdit_json("::::{versionadded} 1\n:::{versionadded} 2\ninner\n:::\nouter\n::::\n");
+        assert_eq!(nodes.len(), 1);
+        let outer = nodes[0].children();
+        assert_eq!(value[0]["children"][0]["attrs"]["argument"], "2");
+        assert_eq!(plain(outer[0].children()), "inner");
+        assert_eq!(plain(&outer[1..]), "outer");
+    }
+
+    #[test]
+    fn unterminated_colon_fence_runs_to_end() {
+        let (nodes, _) = mdit_json(":::{versionadded} 1\ntext\n\nmore\n");
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].children().len(), 2);
+        let (nodes, _) = mdit_json("> :::{versionadded} 1\n> x\n\nafter\n");
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(plain(&nodes[1..]), "after");
+    }
+
+    #[test]
+    fn directive_content_sees_page_references() {
+        let (nodes, _) =
+            mdit_json("```{versionadded} 1\n[x][r] and note[^n]\n```\n\n[r]: /u\n\n[^n]: N.\n");
+        let inline = nodes[0].children()[0].children();
+        let Node::Link(link) = &inline[0] else {
+            panic!("{inline:?}")
+        };
+        assert_eq!(link.url, "/u");
+        assert!(inline.iter().any(|n| n.kind() == "footnote_reference"));
+    }
+
+    /// `nodes` as `kind` or `kind(id)`, top level only.
+    fn ids(nodes: &[Node]) -> Vec<String> {
+        nodes
+            .iter()
+            .map(|n| match n {
+                Node::Anchor(a) => format!("anchor({})", a.id),
+                Node::Section(s) => format!("section({})", s.id.as_deref().unwrap_or("-")),
+                n => n.kind().into_owned(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn target_names_next_section() {
+        let (nodes, _) = mdit_json("(intro)=\n# Intro\n");
+        assert_eq!(ids(&nodes), ["section(intro)"]);
+        let (nodes, _) = mdit_json("(intro)=\n\n## Intro\n");
+        assert_eq!(ids(&nodes), ["section(intro)"]);
+    }
+
+    #[test]
+    fn target_elsewhere_is_anchor() {
+        let input = "(a)=\n\ntext\n";
+        let (nodes, _) = mdit_json(input);
+        assert_eq!(ids(&nodes), ["anchor(a)", "paragraph"]);
+        assert_eq!(at(input, &nodes[0]), "(a)=\n");
+    }
+
+    #[test]
+    fn target_at_end_is_anchor() {
+        let (nodes, _) = mdit_json("text\n(z)=\n");
+        assert_eq!(ids(&nodes), ["paragraph", "anchor(z)"]);
+    }
+
+    #[test]
+    fn explicit_heading_id_wins_over_target() {
+        let (nodes, _) = mdit_json("(t)=\n# H {#x}\n");
+        assert_eq!(ids(&nodes), ["anchor(t)", "section(x)"]);
+    }
+
+    #[test]
+    fn footnote_and_math_edges() {
+        // An undefined label is text; a definition's indented paragraph is
+        // its own.
+        let doc = parse_ok("Undefined[^none] here.\n");
+        assert_eq!(plain_text_of(&doc.children[0]), "Undefined[^none] here.");
+        let doc = parse_ok("x[^a]\n\n[^a]: First.\n\n    Second.\n");
+        let Node::FootnoteDefinition(def) = &doc.children[1] else {
+            panic!("{doc:?}")
+        };
+        assert_eq!(def.children.len(), 2);
+        // `$` before a digit or after a space does not delimit math.
+        let doc = parse_ok("Price $5 and $ x $ no.\n");
+        assert_eq!(plain_text_of(&doc.children[0]), "Price $5 and $ x $ no.");
+        let doc = parse_ok("$$\nx^2\n$$\n");
+        let Node::Math(math) = &doc.children[0].children()[0] else {
+            panic!("{doc:?}")
+        };
+        assert_eq!((math.value.as_str(), math.display), ("\nx^2\n", true));
+    }
+
+    #[test]
+    fn alert_and_definition_edges() {
+        let doc = parse_ok("> [!note]\n> lower\n");
+        let Node::Admonition(alert) = &doc.children[0] else {
+            panic!("{doc:?}")
+        };
+        assert_eq!(alert.kind, "note");
+        let doc = parse_ok("Term\n: One\n: Two\n\nOther\n: Def\n");
+        let kinds: Vec<_> = doc.children[0]
+            .children()
+            .iter()
+            .map(|n| n.kind())
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "definition_term",
+                "definition_description",
+                "definition_description",
+                "definition_term",
+                "definition_description"
+            ]
+        );
+    }
+
+    #[test]
+    fn role_text_reads_as_code() {
+        let (doc, _) = parse_with_syntax("t.md", "{kbd}` a  b `\n", &syntax());
+        let value = serde_json::to_value(&doc.children[0].children()[0]).unwrap();
+        assert_eq!(value["attrs"]["text"], "a  b");
+    }
+
+    /// Asserts every span in `doc` (and its diagnostics) lies in `input`
+    /// on character boundaries.
+    fn spans_in_input(input: &str, doc: &Document, diagnostics: &[Diagnostic]) {
+        let mut spans: Vec<Span> = doc.descendants().filter_map(Node::span).collect();
+        spans.extend(diagnostics.iter().filter_map(|d| d.span));
+        for s in spans {
+            let (a, b) = (s.start as usize, s.end as usize);
+            assert!(
+                a <= b
+                    && b <= input.len()
+                    && input.is_char_boundary(a)
+                    && input.is_char_boundary(b),
+                "span {a}..{b} outside {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn crlf_reads_as_lf_with_spans_in_the_file() {
+        let input = "*a\r\nb*\r\n";
+        let (doc, diagnostics) = parse("t.md", input);
+        spans_in_input(input, &doc, &diagnostics);
+        assert_eq!(at(input, &doc.children[0].children()[0]), "*a\r\nb*");
+        let input = "# T\r\n\r\npara\r\n";
+        let doc = parse_ok(input);
+        let Node::Section(section) = &doc.children[0] else {
+            panic!("{doc:?}")
+        };
+        assert_eq!(at(input, &section.children[0]), "# T\r\n");
+        assert_eq!(at(input, &section.children[1]), "para\r\n");
+    }
+
+    #[test]
+    fn spans_stay_in_the_file() {
+        for input in [
+            "- *x*\n\ta*b*\n",
+            "- *`*\n\ta",
+            ">\t:",
+            "- \n\t:\n",
+            "Intro paragraph here.\n\nword \n*x*\n",
+            "*\u{e9}\r\n]*",
+        ] {
+            let (doc, diagnostics) = parse("t.md", input);
+            spans_in_input(input, &doc, &diagnostics);
+        }
+    }
+
+    #[test]
+    fn inline_argument_span_is_the_argument() {
+        let input = "```{centered} e\n```\n";
+        let (doc, _) = parse_with_syntax("t.md", input, &syntax());
+        let argument = &doc.children[0].children()[0];
+        assert_eq!(argument.span(), Some(Span::new(14, 15)));
+    }
+
+    #[test]
+    fn lazy_lines_continue_footnotes_and_definitions() {
+        let doc = parse_ok("x[^n]\n\n[^n]: a\nb\n");
+        assert_eq!(doc.children.len(), 2, "{doc:?}");
+        assert_eq!(plain(doc.children[1].children()), "a\nb");
+        let doc = parse_ok("Term\n: def\nlazy\n");
+        assert_eq!(doc.children.len(), 1, "{doc:?}");
+        assert_eq!(plain(&doc.children[0].children()[1..]), "def\nlazy");
+    }
+
+    #[test]
+    fn unclosed_math_and_footnotes_are_linear() {
+        let started = std::time::Instant::now();
+        parse_ok(&"$x [^a ".repeat(30_000));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+    }
 
     fn parse_ok(input: &str) -> Document {
         let (doc, diagnostics) = parse("t.md", input);
