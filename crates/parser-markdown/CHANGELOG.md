@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/lsdocs/lsdocs-markdown/compare/lsdocs-parser-markdown/v0.1.0...lsdocs-parser-markdown/v0.2.0) - 2026-11-25
+
+### Added
+
+- [**breaking**] Markdown dialects as features (pulldown-cmark, myst) ([#14](https://github.com/lsdocs/lsdocs-markdown/pull/14))
+
 ### Added
 
 - Dialects as features, all on by default (at least one is required),
