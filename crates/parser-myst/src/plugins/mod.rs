@@ -6,3 +6,4 @@ pub(crate) mod directive;
 pub(crate) mod footnote;
 pub(crate) mod math;
 pub(crate) mod role;
+pub(crate) mod target;

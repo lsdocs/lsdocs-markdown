@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use lsdocs_plugin_sdk::doctree::{
-    Admonition, Align, BlockQuote, CodeBlock, Custom, Document, Emphasis, Heading, Image,
+    Admonition, Align, Anchor, BlockQuote, CodeBlock, Custom, Document, Emphasis, Heading, Image,
     InlineCode, LineBreak, Link, List, ListItem, Metadata, Node, Paragraph, Raw, Section, Span,
     Strong, Table, TableCell, TableRow, Text, ThematicBreak, Value,
 };
@@ -39,6 +39,7 @@ use crate::plugins::directive::{Directive, DirectiveArgument};
 use crate::plugins::footnote::{FootnoteDefinition, FootnoteReference};
 use crate::plugins::math::Math;
 use crate::plugins::role::Role;
+use crate::plugins::target::Target;
 
 /// The document `root` (parsed from `input`) is, plus any problems found.
 pub(crate) fn document(source: &str, input: &str, root: &MdNode) -> (Document, Vec<Diagnostic>) {
@@ -51,7 +52,8 @@ pub(crate) fn document(source: &str, input: &str, root: &MdNode) -> (Document, V
     if let Some(front) = root.cast::<Root>().and_then(|r| r.ext.get::<FrontMatter>()) {
         converter.front_matter(front);
     }
-    let children = converter.nodes(&root.children);
+    let mut children = converter.nodes(&root.children);
+    name_headings(&mut children);
     converter.document.children = sectionize(children);
     (converter.document, converter.diagnostics)
 }
@@ -300,6 +302,11 @@ impl Converter<'_> {
                 attrs: BTreeMap::new(),
                 children: self.nodes(&node.children),
             })
+        } else if let Some(target) = node.cast::<Target>() {
+            Node::Anchor(Anchor {
+                span: self.block_span(node),
+                id: target.label.clone(),
+            })
         } else if let Some(role) = node.cast::<Role>() {
             let span = self.span(node);
             Node::Custom(Custom {
@@ -486,6 +493,26 @@ fn line_offset(input: &str, line: usize) -> usize {
         .match_indices('\n')
         .nth(line - 1)
         .map_or(input.len(), |(i, _)| i + 1)
+}
+
+/// A target directly before a heading (blank lines aside) without an id
+/// of its own names it: the anchor goes and the id becomes the heading's
+/// (its section's, once sectionized).
+fn name_headings(nodes: &mut Vec<Node>) {
+    let mut i = 0;
+    while i + 1 < nodes.len() {
+        if let (Node::Anchor(anchor), Node::Heading(heading)) = (&nodes[i], &nodes[i + 1])
+            && heading.id.is_none()
+        {
+            let id = anchor.id.clone();
+            if let Node::Heading(heading) = &mut nodes[i + 1] {
+                heading.id = Some(id);
+            }
+            nodes.remove(i);
+            continue;
+        }
+        i += 1;
+    }
 }
 
 /// Ends the spans of `nodes` and their descendants at `end` at the latest.

@@ -881,6 +881,46 @@ mod tests {
         assert!(inline.iter().any(|n| n.kind() == "footnote_reference"));
     }
 
+    /// `nodes` as `kind` or `kind(id)`, top level only.
+    fn ids(nodes: &[Node]) -> Vec<String> {
+        nodes
+            .iter()
+            .map(|n| match n {
+                Node::Anchor(a) => format!("anchor({})", a.id),
+                Node::Section(s) => format!("section({})", s.id.as_deref().unwrap_or("-")),
+                n => n.kind().into_owned(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn target_names_next_section() {
+        let (nodes, _) = mdit_json("(intro)=\n# Intro\n");
+        assert_eq!(ids(&nodes), ["section(intro)"]);
+        let (nodes, _) = mdit_json("(intro)=\n\n## Intro\n");
+        assert_eq!(ids(&nodes), ["section(intro)"]);
+    }
+
+    #[test]
+    fn target_elsewhere_is_anchor() {
+        let input = "(a)=\n\ntext\n";
+        let (nodes, _) = mdit_json(input);
+        assert_eq!(ids(&nodes), ["anchor(a)", "paragraph"]);
+        assert_eq!(at(input, &nodes[0]), "(a)=\n");
+    }
+
+    #[test]
+    fn target_at_end_is_anchor() {
+        let (nodes, _) = mdit_json("text\n(z)=\n");
+        assert_eq!(ids(&nodes), ["paragraph", "anchor(z)"]);
+    }
+
+    #[test]
+    fn explicit_heading_id_wins_over_target() {
+        let (nodes, _) = mdit_json("(t)=\n# H {#x}\n");
+        assert_eq!(ids(&nodes), ["anchor(t)", "section(x)"]);
+    }
+
     fn parse_ok(input: &str) -> Document {
         let (doc, diagnostics) = parse("t.md", input);
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
