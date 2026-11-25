@@ -13,6 +13,7 @@ license = "Apache-2.0 OR MIT"
 repository = "https://github.com/lsdocs/lsdocs-markdown"
 
 [workspace.dependencies]
+lsdocs-parser-myst = { path = "crates/parser-myst", version = "0.1.0" }
 lsdocs-plugin-sdk = { git = "https://github.com/lsdocs/lsdocs-plugin-sdk", branch = "main", version = "0.1.0" }
 
 pulldown-cmark = { version = "0.13.6", default-features = false }

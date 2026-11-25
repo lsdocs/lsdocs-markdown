@@ -1,6 +1,7 @@
-//! First-party Markdown parser plugin.
+//! The MyST Markdown parser plugin, `parser-myst`.
 //!
-//! Parses CommonMark (via `pulldown-cmark`) into a document tree in the
+//! Parses CommonMark (via `pulldown-cmark`), with MyST's directives and
+//! roles, into a document tree in the
 //! shared shape (see "Document shape" in `spec/wire.md`). Every node carries
 //! the byte span it came from.
 //!
@@ -50,16 +51,16 @@ use pulldown_cmark::{
 
 /// The plugin, as registered with the host.
 pub fn plugin() -> Plugin {
-    Plugin::new("parser-markdown", env!("CARGO_PKG_VERSION"))
-        .parser(Markdown)
+    Plugin::new("parser-myst", env!("CARGO_PKG_VERSION"))
+        .parser(Myst)
         .cacheable()
 }
 
-/// The Markdown parser.
+/// The MyST parser.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct Markdown;
+pub struct Myst;
 
-impl Parser for Markdown {
+impl Parser for Myst {
     fn extensions(&self) -> Vec<String> {
         vec!["md".into(), "markdown".into()]
     }
