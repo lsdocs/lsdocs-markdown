@@ -10,7 +10,7 @@ enabled); a site lists the plugin of the dialect it is written in.
 
 | Feature | Plugin | Dialect |
 |---|---|---|
-| `md-vanilla` | `parser-md-vanilla` | Markdown as the `pulldown-cmark` library reads it: CommonMark with GitHub tables, task lists and alerts, footnotes, definition lists, math, explicit heading ids and YAML/TOML front matter. Setting: `smart-punctuation` (off by default). |
+| `pulldown-cmark` | `parser-pulldown-cmark` | Markdown as the `pulldown-cmark` library reads it: CommonMark with GitHub tables, task lists and alerts, footnotes, definition lists, math, explicit heading ids and YAML/TOML front matter. Setting: `smart-punctuation` (off by default). |
 | `myst` | `parser-myst` | MyST, on markdown-it (the `markdown-it-rs` crate, the parser MyST is built on): the same constructs, plus directives in ```` ```{name} ```` and `:::{name}` fences (declared ones' content parsed in place, with the page's link references and footnotes), `` {name}`text` `` roles and `(label)=` targets. From `crates/parser-myst` (`lsdocs-parser-myst`). |
 
 Settings go in `.config/lsdocs/<name>/settings.toml`, `name` being the
@@ -42,5 +42,8 @@ smart-punctuation = true
 
 - [ ] A pymdownx dialect (perhaps on zensical's parser).
 - [ ] More MyST syntax as markdown-it rules (see Known limitations).
+- [ ] GFM's remaining extensions in `parser-myst` (markdown-it-rs has
+      strikethrough and linkify rules): strikethrough needs a node in the
+      shared document shape; then bare URL autolinks.
 - [ ] `markdown-it-rs`'s next release (breaking changes): its footnote and
       math plugins, once their node types are public, could replace ours.

@@ -1,4 +1,4 @@
-//! The `md-vanilla` dialect: the `parser-md-vanilla` plugin.
+//! The `pulldown-cmark` dialect: the `parser-pulldown-cmark` plugin.
 //!
 //! Parses Markdown as the `pulldown-cmark` library reads it (CommonMark
 //! plus its extensions) into a document tree in the shared shape (see
@@ -30,6 +30,10 @@
 
 use std::ops::Range;
 
+use ::pulldown_cmark::{
+    Alignment, BlockQuoteKind, CodeBlockKind, Event, MetadataBlockKind, Options, Parser as Cmark,
+    Tag, TagEnd,
+};
 use lsdocs_plugin_sdk::config::{self, Kind};
 use lsdocs_plugin_sdk::doctree::{
     Admonition, Align, BlockQuote, CodeBlock, DefinitionDescription, DefinitionList,
@@ -39,18 +43,14 @@ use lsdocs_plugin_sdk::doctree::{
 };
 use lsdocs_plugin_sdk::protocol::{Diagnostic, ParseParams, ParseResult, Severity};
 use lsdocs_plugin_sdk::{Context, Parser, Plugin, PluginResult};
-use pulldown_cmark::{
-    Alignment, BlockQuoteKind, CodeBlockKind, Event, MetadataBlockKind, Options, Parser as Cmark,
-    Tag, TagEnd,
-};
 
 /// The `smart-punctuation` setting's key.
 const SMART_PUNCTUATION: &str = "smart-punctuation";
 
 /// The plugin, as registered with the host.
 pub fn plugin() -> Plugin {
-    Plugin::new("parser-md-vanilla", env!("CARGO_PKG_VERSION"))
-        .parser(Vanilla)
+    Plugin::new("parser-pulldown-cmark", env!("CARGO_PKG_VERSION"))
+        .parser(PulldownCmark)
         .settings(|c| config::settings_toml_keys(c, &[(SMART_PUNCTUATION, Kind::Bool)]))
         .cacheable()
 }
@@ -75,11 +75,11 @@ impl Settings {
     }
 }
 
-/// The `md-vanilla` parser.
+/// The `pulldown-cmark` parser.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct Vanilla;
+pub struct PulldownCmark;
 
-impl Parser for Vanilla {
+impl Parser for PulldownCmark {
     fn extensions(&self) -> Vec<String> {
         vec!["md".into(), "markdown".into()]
     }
@@ -590,8 +590,10 @@ mod tests {
     /// The plugin's setup with `settings` as its settings file (none if
     /// `None`), in a directory of its own named `tag`.
     fn setup(tag: &str, settings: Option<&str>) -> Result<Value, String> {
-        let dir =
-            std::env::temp_dir().join(format!("lsdocs-md-vanilla-{tag}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "lsdocs-pulldown-cmark-{tag}-{}",
+            std::process::id()
+        ));
         if let Some(text) = settings {
             std::fs::create_dir_all(dir.join("lsdocs/md")).unwrap();
             std::fs::write(dir.join("lsdocs/md/settings.toml"), text).unwrap();
