@@ -11,7 +11,7 @@ enabled); a site lists the plugin of the dialect it is written in.
 | Feature | Plugin | Dialect |
 |---|---|---|
 | `md-vanilla` | `parser-md-vanilla` | Markdown as the `pulldown-cmark` library reads it: CommonMark with GitHub tables, task lists and alerts, footnotes, definition lists, math, explicit heading ids and YAML/TOML front matter. Setting: `smart-punctuation` (off by default). |
-| `myst` | `parser-myst` | The same, plus syntax extensions (directives and roles) in MyST's syntax: ```` ```{name} ```` fences and `` {name}`text` `` roles. From `crates/parser-myst` (`lsdocs-parser-myst`). |
+| `myst` | `parser-myst` | MyST, on markdown-it (the `markdown-it-rs` crate, the parser MyST is built on): the same constructs, plus directives in ```` ```{name} ```` and `:::{name}` fences (declared ones' content parsed in place, with the page's link references and footnotes), `` {name}`text` `` roles and `(label)=` targets. From `crates/parser-myst` (`lsdocs-parser-myst`). |
 
 Settings go in `.config/lsdocs/<name>/settings.toml`, `name` being the
 plugin's name in the site config:
@@ -25,17 +25,15 @@ smart-punctuation = true
 - Strikethrough (`~~x~~`) is not read: the shared document shape has no
   node for it.
 - `parser-myst` has no `smart-punctuation` setting.
-- MyST's colon fences (`:::{name}`) are not read (pulldown-cmark has no
-  hook for them), nor MyST's `(label)=` targets.
-- Directive content is parsed on its own, so it cannot use the page's
-  link reference definitions or footnotes.
+- `parser-myst` reads only part of MyST's syntax: no substitutions,
+  `{attrs}`, `$$` equation labels, `%` comments or `+++` block breaks.
+- `parser-myst` keeps pulldown-cmark's quirks where its output did
+  (spans, footnote and math syntax), so sites read as before the move to
+  markdown-it.
 
 ## TODO
 
-- [ ] `parser-myst` on markdown-it (a maintained fork of the `markdown-it`
-      crate: 0.6.1 fails cargo-deny on RUSTSEC-2024-0421 through `mdurl`),
-      which also brings the two items below.
 - [ ] A pymdownx dialect (perhaps on zensical's parser).
-- [ ] MyST colon fences and `(label)=` targets.
-- [ ] Directive content parsed with the page's link reference definitions
-      and footnotes.
+- [ ] More MyST syntax as markdown-it rules (see Known limitations).
+- [ ] `markdown-it-rs`'s next release (breaking changes): its footnote and
+      math plugins, once their node types are public, could replace ours.

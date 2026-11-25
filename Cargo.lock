@@ -409,7 +409,6 @@ version = "0.1.0"
 dependencies = [
  "lsdocs-plugin-sdk",
  "markdown-it-rs",
- "pulldown-cmark",
  "serde-saphyr",
  "serde_json",
  "toml",
