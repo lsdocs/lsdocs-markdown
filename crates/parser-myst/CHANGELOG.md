@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0](https://github.com/lsdocs/lsdocs-markdown/releases/tag/lsdocs-parser-myst/v0.1.0) - 2026-11-25
+
+### Added
+
+- *(parser-myst)* parse with markdown-it ([#15](https://github.com/lsdocs/lsdocs-markdown/pull/15))
+- [**breaking**] Markdown dialects as features (pulldown-cmark, myst) ([#14](https://github.com/lsdocs/lsdocs-markdown/pull/14))
+
 ### Added
 
 - The MyST parser, moved from `lsdocs-parser-markdown` and registered as
