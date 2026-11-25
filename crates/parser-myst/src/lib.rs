@@ -30,14 +30,18 @@
 //!   content as text, as unknown reStructuredText directives do; other
 //!   roles stay text and code.
 
+mod convert;
+mod md;
+
 use std::collections::BTreeMap;
 use std::ops::Range;
 
+use convert::sectionize;
 use lsdocs_plugin_sdk::doctree::{
     Admonition, Align, BlockQuote, CodeBlock, Custom, DefinitionDescription, DefinitionList,
     DefinitionTerm, Document, Emphasis, FootnoteDefinition, FootnoteReference, Heading, Image,
-    InlineCode, LineBreak, Link, List, ListItem, Math, Metadata, Node, Paragraph, Raw, Section,
-    Span, Strong, Table, TableCell, TableRow, Text, ThematicBreak, Value,
+    InlineCode, LineBreak, Link, List, ListItem, Math, Metadata, Node, Paragraph, Raw, Span,
+    Strong, Table, TableCell, TableRow, Text, ThematicBreak, Value,
 };
 use lsdocs_plugin_sdk::protocol::{
     ArgumentSyntax, ContentSyntax, Diagnostic, DirectiveSyntax, OptionSyntax, ParseParams,
@@ -102,6 +106,14 @@ pub fn parse_with_syntax(
     syntax: &Syntax,
 ) -> (Document, Vec<Diagnostic>) {
     parse_part(source, input, syntax, options())
+}
+
+/// Parses `input` with markdown-it (the pipeline replacing the
+/// pulldown-cmark one; see the plan in docs/superpowers/plans).
+#[cfg_attr(not(test), allow(dead_code))]
+fn parse_mdit(source: &str, input: &str, syntax: &Syntax) -> (Document, Vec<Diagnostic>) {
+    let root = md::parser(syntax).parse(input);
+    convert::document(source, input, &root)
 }
 
 /// Parses `input`, the whole file or a piece of it, with `options`.
@@ -835,62 +847,42 @@ enum MathKind {
     Display,
 }
 
-/// Nests top-level nodes into sections: each heading opens a section that
-/// holds everything up to the next heading of the same or a higher level
-/// (a lower or equal level number). The heading's id moves to the section.
-fn sectionize(nodes: Vec<Node>) -> Vec<Node> {
-    fn add(section: &mut Section, node: Node) {
-        if let (Some(span), Some(end)) = (&mut section.span, node.span()) {
-            span.end = span.end.max(end.end);
-        }
-        section.children.push(node);
-    }
-    fn close(open: &mut Vec<(u8, Section)>, out: &mut Vec<Node>) {
-        if let Some((_, section)) = open.pop() {
-            let node = Node::Section(section);
-            match open.last_mut() {
-                Some((_, parent)) => add(parent, node),
-                None => out.push(node),
-            }
-        }
-    }
-    let mut out = Vec::new();
-    let mut open: Vec<(u8, Section)> = Vec::new();
-    for node in nodes {
-        match node {
-            Node::Heading(mut heading) => {
-                while open
-                    .last()
-                    .is_some_and(|(level, _)| *level >= heading.level)
-                {
-                    close(&mut open, &mut out);
-                }
-                let level = heading.level;
-                let mut section = Section {
-                    span: heading.span,
-                    id: heading.id.take(),
-                    children: vec![],
-                };
-                add(&mut section, Node::Heading(heading));
-                open.push((level, section));
-            }
-            node => match open.last_mut() {
-                Some((_, section)) => add(section, node),
-                None => out.push(node),
-            },
-        }
-    }
-    while !open.is_empty() {
-        close(&mut open, &mut out);
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::panic)]
     use super::*;
     use serde_json::json;
+
+    /// Asserts both pipelines read `input` alike, with `syntax`.
+    fn same_with(input: &str, syntax: &Syntax) {
+        let old = parse_with_syntax("t.md", input, syntax);
+        let new = parse_mdit("t.md", input, syntax);
+        assert_eq!(old, new, "input: {input:?}");
+    }
+
+    /// [`same_with`], with no declared syntax.
+    fn same(input: &str) {
+        same_with(input, &Syntax::default());
+    }
+
+    #[test]
+    fn same_core() {
+        for input in [
+            "# Title\n\nSome *em* and **strong** with `code`.\n\n> quote\n\n---\n",
+            "---\ntitle: Hello\ntags: [a, b]\nweight: 3\n---\n# Hi\n",
+            "+++\ntitle = \"Plus\"\n+++\ntext\n",
+            "---\ntitle: [unclosed\n---\n# Hi\n",
+            "---\n- just\n- a list\n---\n",
+            "intro\n\n# A\n\na\n\n## B\n\n#### D\n\n### C\n\n# E\n\n> ## Quoted\n",
+            "```rust title=\"x.rs\"\nfn main() {}\n```\n\n    indented\n",
+            "3. three\n4. four\n\n- [x] done\n- [ ] todo\n",
+            "| a | b |\n|:--|--:|\n| 1 | 2 |\n",
+            "[docs](guide.md \"Guide\") ![alt *text*](a.png)  \nnext <b>x</b>\n\n<div>\nblock\n</div>\n",
+            "one\ntwo\n",
+        ] {
+            same(input);
+        }
+    }
 
     fn parse_ok(input: &str) -> Document {
         let (doc, diagnostics) = parse("t.md", input);
