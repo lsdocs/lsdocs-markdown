@@ -86,11 +86,14 @@ def "nur unlink" [name?: string] {
 }
 
 # Checks each crate on its own `rust-version` (installing the toolchains),
-# without default features, then the workspace on the highest one.
+# without default features (or with only those its
+# `package.metadata.lsdocs.msrv-features` lists, for a crate that needs
+# one), then the workspace on the highest one.
 def "nur msrv" [] {
     let groups = (
         cargo-org-out metadata --no-deps --format-version 1 | from json | get packages
-        | select name rust_version | group-by rust_version
+        | each {|p| {name: $p.name, rust_version: $p.rust_version, features: ($p.metadata? | get -o lsdocs.msrv-features | default [])} }
+        | group-by rust_version
         | transpose version crates
         | sort-by {|g| $g.version | split row "." | each { into int } | $in.0 * 1000 + $in.1 }
     )
@@ -98,7 +101,9 @@ def "nur msrv" [] {
         run-cmd rustup toolchain install $group.version --profile minimal --no-self-update
         let names = $group.crates | get name
         print $"Rust ($group.version): ($names | str join ', ')"
-        cargo-org $"+($group.version)" check --no-default-features ...($names | each {|n| [-p $n] } | flatten)
+        let features = $group.crates | each {|c| $c.features | each {|f| $"($c.name)/($f)" } } | flatten
+        let features = if ($features | is-empty) { [] } else { [--features ($features | str join ",")] }
+        cargo-org $"+($group.version)" check --no-default-features ...$features ...($names | each {|n| [-p $n] } | flatten)
     }
     let highest = $groups | last | get version
     print $"Rust ($highest): the workspace, default features"

@@ -43,7 +43,9 @@ shows them. `nur ci` runs what CI runs: run it before committing. Tools:
 - No panics outside tests: clippy denies `unwrap_used`, `expect_used` and
   `panic` in library, binary and example code. Tests opt in per module
   (`#![allow(clippy::unwrap_used)]`).
-- Licensing: `Apache-2.0 OR MIT`. Nothing is published.
+- Licensing: `Apache-2.0 OR MIT`.
+- Publishing: merging release-plz's release PR publishes the bumped
+  crates to crates.io (`.github/workflows/release.yml`).
 - Record what is left open in README.md's TODO section, and what the code
   does not do (or does differently) under Known limitations.
 
@@ -51,8 +53,12 @@ shows them. `nur ci` runs what CI runs: run it before committing. Tools:
 
 | Path | What |
 |---|---|
-| `crates/parser-markdown` | `lsdocs-parser-markdown`: the Markdown parser plugin. |
+| `crates/parser-markdown` | `lsdocs-parser-markdown`: the Markdown parser plugins, one per dialect, each behind a feature (all on by default; at least one required). `pulldown-cmark` (`src/pulldown_cmark.rs`, plugin `parser-pulldown-cmark`) is here; `myst` re-exports `lsdocs-parser-myst`. |
+| `crates/parser-myst` | `lsdocs-parser-myst`: the MyST dialect (plugin `parser-myst`). |
 
-It produces the shared document shape (nested sections, explicit ids
+A crate that cannot build without default features lists the features
+`nur msrv` checks it with in `[package.metadata.lsdocs] msrv-features`.
+
+Each dialect produces the shared document shape (nested sections, explicit ids
 only, core node kinds; see "Document shape" in lsdocs-protocol's
 `spec/wire.md`); the host generates ids and link targets after parsing.

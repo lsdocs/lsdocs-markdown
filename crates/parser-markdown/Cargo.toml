@@ -1,6 +1,6 @@
 [package]
 name = "lsdocs-parser-markdown"
-description = "First-party Markdown parser plugin."
+description = "First-party Markdown parser plugins, one per dialect."
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
@@ -10,9 +10,25 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = ["pulldown-cmark", "myst"]
+# Each dialect is its own lsdocs plugin; at least one must be enabled.
+# Markdown as the pulldown-cmark library reads it (`parser-pulldown-cmark`).
+pulldown-cmark = ["dep:lsdocs-plugin-sdk", "dep:pulldown-cmark", "dep:serde-saphyr", "dep:toml"]
+# MyST (`parser-myst`), from `lsdocs-parser-myst`.
+myst = ["dep:lsdocs-parser-myst"]
+
 [dependencies]
-lsdocs-plugin-sdk.workspace = true
-pulldown-cmark.workspace = true
-serde-saphyr.workspace = true
+lsdocs-parser-myst = { workspace = true, optional = true }
+lsdocs-plugin-sdk = { workspace = true, optional = true }
+pulldown-cmark = { workspace = true, optional = true }
+serde-saphyr = { workspace = true, optional = true }
+toml = { workspace = true, optional = true }
+
+[dev-dependencies]
 serde_json.workspace = true
-toml.workspace = true
+
+# `nur msrv` checks this crate with these features (it cannot build
+# without a dialect).
+[package.metadata.lsdocs]
+msrv-features = ["pulldown-cmark"]
